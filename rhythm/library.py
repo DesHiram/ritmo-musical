@@ -8,8 +8,9 @@ from .models import SavedSong
 
 
 class SongLibrary:
-    def __init__(self, library_file: Path) -> None:
+    def __init__(self, library_file: Path, legacy_library_file: Path | None = None) -> None:
         self.library_file = library_file
+        self.legacy_library_file = legacy_library_file
         self.warning = ""
         self.saved_songs = self._load_saved_songs()
         self.song_scroll = 0
@@ -59,6 +60,12 @@ class SongLibrary:
 
         return removed_song, self.persist_saved_songs()
 
+    def clear_songs(self) -> str | None:
+        self.saved_songs.clear()
+        self.selected_song_index = None
+        self.song_scroll = 0
+        return self.persist_saved_songs()
+
     def match_selection(self, file_path: Path) -> int | None:
         normalized_key = self.normalize_song_key(file_path)
         self.selected_song_index = None
@@ -99,11 +106,15 @@ class SongLibrary:
         return str(normalized).casefold()
 
     def _load_saved_songs(self) -> list[SavedSong]:
-        if not self.library_file.exists():
+        source_file = self.library_file
+        if not source_file.exists() and self.legacy_library_file and self.legacy_library_file.exists():
+            source_file = self.legacy_library_file
+
+        if not source_file.exists():
             return []
 
         try:
-            payload = json.loads(self.library_file.read_text(encoding="utf-8"))
+            payload = json.loads(source_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             self.warning = f"No se pudo leer la biblioteca guardada: {exc}"
             return []

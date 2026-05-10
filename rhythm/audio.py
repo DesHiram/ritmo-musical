@@ -22,7 +22,7 @@ class TrackBuilder:
             sr=sample_rate,
             hop_length=hop_length,
         )
-        tempo, _ = librosa.beat.beat_track(
+        tempo, beat_frames = librosa.beat.beat_track(
             onset_envelope=onset_envelope,
             sr=sample_rate,
             hop_length=hop_length,
@@ -36,6 +36,7 @@ class TrackBuilder:
         melody_frames = self.build_melody_event_frames(
             melody_curve=melody_curve,
             onset_envelope=onset_envelope,
+            beat_frames=beat_frames,
             sample_rate=sample_rate,
             hop_length=hop_length,
         )
@@ -100,6 +101,7 @@ class TrackBuilder:
         self,
         melody_curve: np.ndarray,
         onset_envelope: np.ndarray,
+        beat_frames: np.ndarray,
         sample_rate: int,
         hop_length: int,
     ) -> np.ndarray:
@@ -122,6 +124,7 @@ class TrackBuilder:
         accent_floor = max_onset_strength * 0.28
 
         events: list[int] = []
+        beat_frame_set = {int(frame) for frame in np.asarray(beat_frames).reshape(-1)}
         previous_frame = -999_999
         previous_lane: int | None = None
         last_sustain_frame = -999_999
@@ -137,9 +140,16 @@ class TrackBuilder:
             )
             has_lane_change = previous_lane is not None and lane != previous_lane
             has_accent = self.is_local_onset_peak(frame, onset_envelope, accent_floor)
+            is_main_beat = self.is_near_main_beat(frame, beat_frame_set)
             needs_sustain = frame - last_sustain_frame >= sustain_gap_frames
 
-            should_add = previous_lane is None or has_lane_change or has_accent or needs_sustain
+            should_add = (
+                previous_lane is None
+                or has_lane_change
+                or has_accent
+                or is_main_beat
+                or needs_sustain
+            )
             if should_add and frame - previous_frame >= min_gap_frames:
                 events.append(frame)
                 previous_frame = frame
@@ -148,6 +158,9 @@ class TrackBuilder:
             previous_lane = lane
 
         return np.asarray(events, dtype=int)
+
+    def is_near_main_beat(self, frame: int, beat_frame_set: set[int]) -> bool:
+        return any((frame + offset) in beat_frame_set for offset in range(-1, 2))
 
     def smooth_melody_curve(self, melody_curve: np.ndarray) -> np.ndarray:
         finite_pitch = np.isfinite(melody_curve)

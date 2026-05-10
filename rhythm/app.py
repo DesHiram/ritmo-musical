@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import platform
 from pathlib import Path
+import re
 import sys
 import tkinter as tk
 from tkinter import filedialog
@@ -8,7 +11,15 @@ from tkinter import filedialog
 import pygame
 
 from .audio import TrackBuilder
-from .constants import APP_TITLE, FPS, LIBRARY_FILENAME, WINDOW_HEIGHT, WINDOW_WIDTH
+from .constants import (
+    APP_TITLE,
+    BEATMAPS_DIR,
+    FPS,
+    LEGACY_LIBRARY_FILENAME,
+    LIBRARY_FILENAME_TEMPLATE,
+    WINDOW_HEIGHT,
+    WINDOW_WIDTH,
+)
 from .library import SongLibrary
 from .models import TrackAnalysis
 from .rendering import RhythmRenderer, resource_path
@@ -35,8 +46,15 @@ class RhythmPrototype:
             project_root = Path(sys.executable).resolve().parent
         else:
             project_root = Path(__file__).resolve().parent.parent
+        self.project_root = project_root
         self.current_screen = "home"
-        self.library = SongLibrary(project_root / LIBRARY_FILENAME)
+        legacy_library_file = (
+            project_root / LEGACY_LIBRARY_FILENAME if sys.platform.startswith("win") else None
+        )
+        self.library = SongLibrary(
+            project_root / platform_library_filename(),
+            legacy_library_file=legacy_library_file,
+        )
 
         self.selected_file: Path | None = None
         self.analysis_source: Path | None = None
@@ -150,6 +168,10 @@ class RhythmPrototype:
             self.select_audio_file()
             return
 
+        if self.renderer.clear_library_button.collidepoint(mouse_pos):
+            self.clear_saved_songs()
+            return
+
         if self.renderer.scroll_up_button.collidepoint(mouse_pos):
             self.library.scroll_song_list(-1)
             return
@@ -205,11 +227,34 @@ class RhythmPrototype:
             self.stop_playback()
             self.analysis = None
             self.analysis_source = None
+        if not self.library.saved_songs:
+            self.stop_playback()
+            self.selected_file = None
+            self.analysis = None
+            self.analysis_source = None
+            self.analysis_cache.clear()
 
         if save_error:
             self.status_message = save_error
         else:
             self.status_message = f"'{removed_song.display_name}' fue eliminada del repertorio."
+
+    def clear_saved_songs(self) -> None:
+        if not self.library.saved_songs:
+            self.status_message = "El repertorio ya esta vacio."
+            return
+
+        save_error = self.library.clear_songs()
+        self.stop_playback()
+        self.selected_file = None
+        self.analysis_source = None
+        self.analysis = None
+        self.analysis_cache.clear()
+
+        if save_error:
+            self.status_message = save_error
+        else:
+            self.status_message = "Se eliminaron todas las canciones del repertorio."
 
     def pause_track(self) -> None:
         if not self.is_playing or self.is_paused:
@@ -308,6 +353,7 @@ class RhythmPrototype:
             if not analysis.notes:
                 raise ValueError("No se encontraron beats utiles.")
 
+            beatmap_path = self.export_beatmap(self.selected_file, analysis)
             self.analysis = analysis
             self.analysis_source = self.selected_file
             self.current_screen = "game"
@@ -318,10 +364,30 @@ class RhythmPrototype:
             source_label = "lista" if from_cache else "generada"
             self.status_message = (
                 f"Pista {source_label}: {len(self.analysis.notes)} notas | "
-                f"{self.analysis.tempo:.1f} BPM"
+                f"{self.analysis.tempo:.1f} BPM | JSON: {beatmap_path.name}"
             )
         except Exception as exc:  # pragma: no cover - UI path
             self.status_message = f"No se pudo generar la pista: {exc}"
+
+    def export_beatmap(self, audio_file: Path, analysis: TrackAnalysis) -> Path:
+        beatmaps_dir = self.project_root / BEATMAPS_DIR
+        beatmaps_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", audio_file.stem).strip("._")
+        if not safe_stem:
+            safe_stem = "cancion"
+
+        beatmap_path = beatmaps_dir / f"{safe_stem}.json"
+        payload = [
+            {
+                "time": round(note.hit_time, 3),
+                "lane": note.lane + 1,
+                "duration": round(note.duration, 3) if note.duration else 0,
+            }
+            for note in analysis.notes
+        ]
+        beatmap_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return beatmap_path
 
     def open_visualizer(self) -> None:
         if not self.is_selected_track_ready():
@@ -443,3 +509,10 @@ class RhythmPrototype:
 
     def draw(self) -> None:
         self.renderer.draw(self)
+
+
+def platform_library_filename() -> str:
+    system = platform.system().lower() or sys.platform
+    machine = platform.machine().lower() or "unknown"
+    platform_key = re.sub(r"[^a-z0-9._-]+", "_", f"{system}_{machine}").strip("._")
+    return LIBRARY_FILENAME_TEMPLATE.format(platform=platform_key)

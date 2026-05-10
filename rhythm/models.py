@@ -8,6 +8,7 @@ from pathlib import Path
 class NoteEvent:
     lane: int
     hit_time: float
+    duration: float = 0.0
 
 
 @dataclass
