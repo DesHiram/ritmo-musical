@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -19,3 +20,7 @@ class TrackAnalysis:
 class SavedSong:
     name: str
     path: str
+
+    @property
+    def display_name(self) -> str:
+        return Path(self.name).stem or self.name

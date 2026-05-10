@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import random
+import sys
 from typing import TYPE_CHECKING
 
+import imageio.v2 as imageio
 import pygame
 
 from .constants import (
@@ -27,11 +29,91 @@ from .constants import (
     TEXT_COLOR,
     WINDOW_HEIGHT,
     WINDOW_WIDTH,
+    APP_TITLE,
 )
 from .library import SongLibrary
 
 if TYPE_CHECKING:
     from .app import RhythmPrototype
+
+
+class LoopingVideo:
+    def __init__(self, file_path: Path, size: tuple[int, int]) -> None:
+        self.file_path = file_path
+        self.size = size
+        self.reader = None
+        self.frame_count = 0
+        self.fps = 24.0
+        self.current_index = -1
+        self.current_surface: pygame.Surface | None = None
+        self.open()
+
+    def open(self) -> None:
+        try:
+            self.reader = imageio.get_reader(str(self.file_path))
+            metadata = self.reader.get_meta_data()
+            self.fps = float(metadata.get("fps") or 24.0)
+            frame_count = metadata.get("nframes") or 0
+            self.frame_count = int(frame_count) if frame_count != float("inf") else 0
+            if self.frame_count <= 0 and metadata.get("duration"):
+                self.frame_count = max(1, int(float(metadata["duration"]) * self.fps))
+        except Exception:
+            self.reader = None
+
+    def frame_for_time(self, song_time: float, advance: bool) -> pygame.Surface | None:
+        if self.reader is None:
+            return self.current_surface
+
+        if advance:
+            target_index = int(max(0.0, song_time) * self.fps)
+            if self.frame_count > 0:
+                target_index %= self.frame_count
+        else:
+            target_index = max(0, self.current_index)
+
+        if target_index == self.current_index and self.current_surface is not None:
+            return self.current_surface
+
+        try:
+            frame = self.reader.get_data(target_index)
+        except Exception:
+            try:
+                self.reader.close()
+            except Exception:
+                pass
+            self.open()
+            target_index = 0
+            try:
+                frame = self.reader.get_data(target_index) if self.reader is not None else None
+            except Exception:
+                return self.current_surface
+
+        if frame is None:
+            return self.current_surface
+
+        frame_format = "RGBA" if frame.shape[2] == 4 else "RGB"
+        frame_surface = pygame.image.frombuffer(frame.tobytes(), frame.shape[1::-1], frame_format).convert()
+        self.current_surface = cover_scale(frame_surface, self.size)
+        self.current_index = target_index
+        return self.current_surface
+
+
+def resource_path(*parts: str) -> Path:
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base_path.joinpath(*parts)
+
+
+def cover_scale(surface: pygame.Surface, size: tuple[int, int]) -> pygame.Surface:
+    target_width, target_height = size
+    source_width, source_height = surface.get_size()
+    scale = max(target_width / source_width, target_height / source_height)
+    scaled = pygame.transform.smoothscale(
+        surface,
+        (int(source_width * scale), int(source_height * scale)),
+    )
+    crop_rect = pygame.Rect(0, 0, target_width, target_height)
+    crop_rect.center = scaled.get_rect().center
+    return scaled.subsurface(crop_rect).copy()
 
 
 class RhythmRenderer:
@@ -46,31 +128,101 @@ class RhythmRenderer:
         self.title_font = title_font
         self.body_font = body_font
         self.small_font = small_font
+        self.header_title_font = pygame.font.SysFont("arial", 44, bold=True)
 
-        self.upload_button = pygame.Rect(36, 36, 180, 44)
-        self.generate_button = pygame.Rect(232, 36, 200, 44)
-        self.view_button = pygame.Rect(448, 36, 190, 44)
+        self.settings_button = pygame.Rect(WINDOW_WIDTH - 92, 30, 48, 48)
+        self.upload_button = pygame.Rect(44, 112, 190, 46)
+        self.back_button = pygame.Rect(WINDOW_WIDTH - 190, 112, 146, 46)
 
-        self.replay_button = pygame.Rect(36, 36, 210, 44)
-        self.stop_button = pygame.Rect(262, 36, 140, 44)
-        self.back_button = pygame.Rect(418, 36, 170, 44)
+        self.replay_button = pygame.Rect(0, 0, 1, 1)
+        self.stop_button = pygame.Rect(0, 0, 1, 1)
+        self.view_button = pygame.Rect(0, 0, 1, 1)
+        self.generate_button = pygame.Rect(0, 0, 1, 1)
+
+        self.pause_button = pygame.Rect(WINDOW_WIDTH - 76, 24, 48, 42)
+        self.pause_menu = pygame.Rect(WINDOW_WIDTH // 2 - 160, WINDOW_HEIGHT // 2 - 112, 320, 224)
+        self.pause_continue_button = pygame.Rect(self.pause_menu.x + 36, self.pause_menu.y + 58, 248, 42)
+        self.pause_replay_button = pygame.Rect(self.pause_menu.x + 36, self.pause_menu.y + 110, 248, 42)
+        self.pause_exit_button = pygame.Rect(self.pause_menu.x + 36, self.pause_menu.y + 162, 248, 42)
 
         self.selection_card = pygame.Rect(36, 158, WINDOW_WIDTH - 72, 96)
-        self.library_panel = pygame.Rect(36, 272, WINDOW_WIDTH - 72, 400)
+        self.library_panel = pygame.Rect(44, 126, WINDOW_WIDTH - 88, 524)
         self.scroll_up_button = pygame.Rect(self.library_panel.right - 92, self.library_panel.y + 18, 36, 32)
         self.scroll_down_button = pygame.Rect(self.library_panel.right - 48, self.library_panel.y + 18, 36, 32)
+        self.home_start_button = pygame.Rect(self.library_panel.right - 262, self.library_panel.bottom - 58, 150, 38)
 
         self.lane_area = pygame.Rect(74, LANE_TOP, 852, LANE_BOTTOM - LANE_TOP)
+        self.video_panel = pygame.Rect(
+            self.lane_area.x + 24,
+            LANE_TOP + 10,
+            self.lane_area.width - 48,
+            HIT_ZONE_Y + 58 - (LANE_TOP + 10),
+        )
+        self.background_image = self.load_background_image()
+        self.lane_icons = self.load_lane_icons()
+        self.video_loop = self.load_video_loop()
         self.visualizer_particles = self.build_visualizer_particles()
+        self.menu_scene = self.build_menu_scene_surface()
         self.visualizer_scene = self.build_visualizer_scene_surface()
+        self.lane_scene = self.build_lane_scene_surface()
 
     def draw(self, app: RhythmPrototype) -> None:
-        self.screen.fill(BACKGROUND_COLOR)
-        if app.current_screen == "setup":
-            self.draw_setup_screen(app)
+        if app.current_screen == "home":
+            self.draw_home_screen(app)
             return
 
-        self.draw_visualizer_screen(app)
+        if app.current_screen == "settings":
+            self.draw_settings_screen(app)
+            return
+
+        self.draw_game_screen(app)
+
+    def draw_home_screen(self, app: RhythmPrototype) -> None:
+        self.screen.blit(self.menu_scene, (0, 0))
+        self.draw_app_header(app, "")
+        self.draw_library_panel(app, mode="home")
+
+    def draw_settings_screen(self, app: RhythmPrototype) -> None:
+        self.screen.blit(self.menu_scene, (0, 0))
+        self.draw_app_header(app, "Configuracion")
+        self.draw_button(self.upload_button, "Subir cancion", True)
+        self.draw_button(self.back_button, "Volver", True)
+        status_surface = self.small_font.render(
+            self.fit_text(app.status_message, self.small_font, WINDOW_WIDTH - 88),
+            True,
+            MUTED_TEXT,
+        )
+        self.screen.blit(status_surface, (44, 172))
+        self.library_panel.y = 212
+        self.scroll_up_button.y = self.library_panel.y + 18
+        self.scroll_down_button.y = self.library_panel.y + 18
+        self.draw_library_panel(app, mode="settings")
+        self.library_panel.y = 126
+        self.scroll_up_button.y = self.library_panel.y + 18
+        self.scroll_down_button.y = self.library_panel.y + 18
+
+    def draw_app_header(self, app: RhythmPrototype, section: str) -> None:
+        header = pygame.Rect(28, 18, WINDOW_WIDTH - 56, 86)
+        self.draw_glass_rect(header, PANEL_COLOR, border_radius=20)
+        glow = self.header_title_font.render(APP_TITLE, True, (255, 78, 206))
+        title = self.header_title_font.render(APP_TITLE, True, TEXT_COLOR)
+        glow_rect = glow.get_rect(center=(header.centerx + 4, header.y + 41))
+        title_rect = title.get_rect(center=(header.centerx, header.y + 37))
+        self.screen.blit(glow, glow_rect)
+        self.screen.blit(title, title_rect)
+        if section:
+            subtitle = self.small_font.render(section.upper(), True, MUTED_TEXT)
+            subtitle_rect = subtitle.get_rect(center=(header.centerx, header.y + 66))
+            self.screen.blit(subtitle, subtitle_rect)
+
+        count_text = self.small_font.render(
+            f"{len(app.library.saved_songs)} canciones",
+            True,
+            (255, 244, 142),
+        )
+        self.screen.blit(count_text, (WINDOW_WIDTH - 250, 58))
+        if app.current_screen == "home":
+            self.draw_icon_button(self.settings_button, "gear", True)
 
     def draw_setup_screen(self, app: RhythmPrototype) -> None:
         pygame.draw.rect(self.screen, PANEL_COLOR, (0, 0, WINDOW_WIDTH, 126))
@@ -127,7 +279,7 @@ class RhythmRenderer:
             return
 
         song_name = self.body_font.render(
-            self.fit_text(app.selected_file.name, self.body_font, self.selection_card.width - 36),
+            self.fit_text(app.selected_file.stem, self.body_font, self.selection_card.width - 36),
             True,
             TEXT_COLOR,
         )
@@ -150,22 +302,18 @@ class RhythmRenderer:
         detail = self.small_font.render(detail_text, True, MUTED_TEXT)
         self.screen.blit(detail, (self.selection_card.right - 400, self.selection_card.y + 14))
 
-    def draw_library_panel(self, app: RhythmPrototype) -> None:
-        pygame.draw.rect(self.screen, CARD_COLOR, self.library_panel, border_radius=18)
-        pygame.draw.rect(
-            self.screen,
-            CARD_BORDER,
-            self.library_panel,
-            width=2,
-            border_radius=18,
-        )
+    def draw_library_panel(self, app: RhythmPrototype, mode: str = "home") -> None:
+        self.configure_library_controls(mode)
+        self.draw_glass_rect(self.library_panel, CARD_COLOR, border_radius=24)
 
-        title = self.body_font.render("Canciones guardadas", True, TEXT_COLOR)
-        helper = self.small_font.render(
-            "Haz clic en una cancion para seleccionarla. La lista queda guardada entre sesiones.",
-            True,
-            MUTED_TEXT,
+        title_text = "Canciones guardadas" if mode == "home" else "Administrar canciones"
+        helper_text = (
+            "Presiona Iniciar para jugar."
+            if mode == "home"
+            else "Sube nuevas canciones o elimina las que ya no quieras ver en el repertorio."
         )
+        title = self.body_font.render(title_text, True, TEXT_COLOR)
+        helper = self.small_font.render(helper_text, True, MUTED_TEXT)
         self.screen.blit(title, (self.library_panel.x + 20, self.library_panel.y + 16))
         self.screen.blit(helper, (self.library_panel.x + 20, self.library_panel.y + 42))
 
@@ -181,10 +329,19 @@ class RhythmRenderer:
             app.library.song_scroll < app.library.max_song_scroll(),
             font=self.small_font,
         )
+        if mode == "home":
+            selected_index = app.library.selected_song_index
+            selected_song = (
+                app.library.saved_songs[selected_index]
+                if selected_index is not None and 0 <= selected_index < len(app.library.saved_songs)
+                else None
+            )
+            can_start = selected_song is not None and Path(selected_song.path).exists()
+            self.draw_button(self.home_start_button, "Iniciar", can_start, font=self.small_font)
 
         if not app.library.saved_songs:
             hint = self.body_font.render(
-                "Aun no tienes canciones guardadas. Sube una para empezar.",
+                "Aun no tienes canciones guardadas. Entra a configuracion y sube una.",
                 True,
                 MUTED_TEXT,
             )
@@ -205,27 +362,48 @@ class RhythmRenderer:
             else:
                 row_color = LIST_ITEM_COLOR
 
-            pygame.draw.rect(self.screen, row_color, row_rect, border_radius=14)
-            pygame.draw.rect(self.screen, CARD_BORDER, row_rect, width=1, border_radius=14)
+            self.draw_glass_rect(row_rect, row_color, border_radius=16, border_alpha=68)
+            text_x = row_rect.x + 20
+            if mode == "settings":
+                lane_color = LANE_COLORS[song_index % len(LANE_COLORS)]
+                pygame.draw.rect(
+                    self.screen,
+                    lane_color,
+                    pygame.Rect(row_rect.x, row_rect.y + 6, 5, row_rect.height - 12),
+                    border_radius=3,
+                )
+                pygame.draw.circle(self.screen, (*lane_color, 120), (row_rect.x + 34, row_rect.centery), 18)
+                pygame.draw.circle(self.screen, lane_color, (row_rect.x + 34, row_rect.centery), 9)
+                text_x = row_rect.x + 62
 
             name_text = self.body_font.render(
-                self.fit_text(song.name, self.body_font, row_rect.width - 180),
+                self.fit_text(song.display_name, self.body_font, row_rect.width - (40 if mode == "home" else 210)),
                 True,
                 TEXT_COLOR,
             )
-            self.screen.blit(name_text, (row_rect.x + 14, row_rect.y + 8))
+            name_rect = name_text.get_rect(midleft=(text_x, row_rect.centery))
+            self.screen.blit(name_text, name_rect)
 
-            state_label = "Disponible" if song_exists else "No encontrada"
-            state_color = TEXT_COLOR if song_exists else MUTED_TEXT
-            state_text = self.small_font.render(state_label, True, state_color)
-            self.screen.blit(state_text, (row_rect.right - 120, row_rect.y + 10))
+            if mode == "settings":
+                self.draw_button(self.song_action_rect(row_offset), "Eliminar", True, font=self.small_font)
 
-            path_text = self.small_font.render(
-                self.fit_text(song.path, self.small_font, row_rect.width - 28),
+    def draw_game_screen(self, app: RhythmPrototype) -> None:
+        self.screen.blit(self.visualizer_scene, (0, 0))
+        self.draw_video_panel(app)
+        self.screen.blit(self.lane_scene, (0, 0))
+        self.draw_lane_view(app)
+        self.draw_button(self.pause_button, "||", True, font=self.body_font)
+
+        if app.is_paused:
+            self.draw_pause_overlay()
+        elif app.analysis and not app.is_playing:
+            hint = self.small_font.render(
+                self.fit_text(app.status_message, self.small_font, self.lane_area.width - 80),
                 True,
-                MUTED_TEXT,
+                TEXT_COLOR,
             )
-            self.screen.blit(path_text, (row_rect.x + 14, row_rect.y + 28))
+            hint_rect = hint.get_rect(center=(WINDOW_WIDTH // 2, LANE_TOP + 34))
+            self.screen.blit(hint, hint_rect)
 
     def draw_visualizer_screen(self, app: RhythmPrototype) -> None:
         self.screen.blit(self.visualizer_scene, (0, 0))
@@ -248,7 +426,7 @@ class RhythmRenderer:
         self.draw_button(self.stop_button, "Detener", app.is_playing)
         self.draw_button(self.back_button, "Volver", True)
 
-        track_name = app.analysis_source.name if app.analysis_source else "Sin pista"
+        track_name = app.analysis_source.stem if app.analysis_source else "Sin pista"
         info_text = f"Pista: {track_name}"
         if app.analysis:
             info_text += f" | {len(app.analysis.notes)} notas | {app.analysis.tempo:.1f} BPM"
@@ -283,15 +461,80 @@ class RhythmRenderer:
     ) -> None:
         button_font = font or self.body_font
         mouse_over = rect.collidepoint(pygame.mouse.get_pos())
-        color = BUTTON_COLOR if enabled else BUTTON_DISABLED
-        if enabled and mouse_over:
-            color = BUTTON_HOVER
-
-        pygame.draw.rect(self.screen, color, rect, border_radius=12)
-        pygame.draw.rect(self.screen, (255, 255, 255), rect, width=2, border_radius=12)
+        if enabled:
+            left_color = BUTTON_HOVER if mouse_over else BUTTON_COLOR
+            right_color = (81, 221, 255) if mouse_over else (122, 89, 255)
+            self.draw_gradient_rect(rect, left_color, right_color, border_radius=14)
+        else:
+            self.draw_gradient_rect(rect, BUTTON_DISABLED, (78, 82, 120), border_radius=14)
+        pygame.draw.rect(self.screen, (255, 255, 255, 180), rect, width=2, border_radius=14)
+        shine_rect = pygame.Rect(rect.x + 5, rect.y + 5, rect.width - 10, max(6, rect.height // 3))
+        shine = pygame.Surface(shine_rect.size, pygame.SRCALPHA)
+        shine.fill((255, 255, 255, 38 if enabled else 18))
+        self.screen.blit(shine, shine_rect)
         text_surface = button_font.render(label, True, TEXT_COLOR)
         text_rect = text_surface.get_rect(center=rect.center)
         self.screen.blit(text_surface, text_rect)
+
+    def draw_icon_button(self, rect: pygame.Rect, icon: str, enabled: bool) -> None:
+        mouse_over = rect.collidepoint(pygame.mouse.get_pos())
+        left_color = BUTTON_HOVER if mouse_over else (255, 90, 209)
+        right_color = (78, 226, 255) if mouse_over else (124, 96, 255)
+        self.draw_gradient_rect(rect, left_color if enabled else BUTTON_DISABLED, right_color, border_radius=14)
+        pygame.draw.rect(self.screen, (255, 255, 255, 190), rect, width=2, border_radius=14)
+        if icon == "gear":
+            center = rect.center
+            pygame.draw.circle(self.screen, TEXT_COLOR, center, 12, 3)
+            pygame.draw.circle(self.screen, TEXT_COLOR, center, 3)
+            for angle in range(0, 360, 45):
+                direction = pygame.Vector2(1, 0).rotate(angle)
+                start = pygame.Vector2(center) + direction * 15
+                end = pygame.Vector2(center) + direction * 19
+                pygame.draw.line(self.screen, TEXT_COLOR, start, end, 3)
+
+    def draw_pause_overlay(self) -> None:
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((9, 10, 34, 146))
+        self.screen.blit(overlay, (0, 0))
+
+        self.draw_glass_rect(self.pause_menu, (255, 255, 255, 48), border_radius=24)
+        title = self.title_font.render("Pausa", True, TEXT_COLOR)
+        title_rect = title.get_rect(center=(self.pause_menu.centerx, self.pause_menu.y + 30))
+        self.screen.blit(title, title_rect)
+        self.draw_button(self.pause_continue_button, "Continue", True, font=self.body_font)
+        self.draw_button(self.pause_replay_button, "Replay", True, font=self.body_font)
+        self.draw_button(self.pause_exit_button, "Exit", True, font=self.body_font)
+
+    def draw_video_panel(self, app: RhythmPrototype) -> None:
+        frame = None
+        if self.video_loop is not None and app.analysis is not None:
+            frame = self.video_loop.frame_for_time(app.current_song_time(), app.is_playing and not app.is_paused)
+
+        video_surface = pygame.Surface(self.video_panel.size, pygame.SRCALPHA)
+        if frame is not None:
+            video_surface.blit(frame, (0, 0))
+            video_surface.set_alpha(145)
+        else:
+            video_surface.fill((255, 255, 255, 18))
+
+        mask = pygame.Surface(self.video_panel.size, pygame.SRCALPHA)
+        pygame.draw.polygon(mask, (255, 255, 255, 255), self.video_mask_points())
+        video_surface.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        self.screen.blit(video_surface, self.video_panel)
+
+    def video_mask_points(self) -> list[tuple[int, int]]:
+        left_top, right_top = self.track_bounds_for_y(LANE_TOP + 10)
+        left_bottom, right_bottom = self.track_bounds_for_y(HIT_ZONE_Y + 50)
+        points = [
+            (left_top, LANE_TOP + 10),
+            (right_top, LANE_TOP + 10),
+            (right_bottom, HIT_ZONE_Y + 50),
+            (left_bottom, HIT_ZONE_Y + 50),
+        ]
+        return [
+            (int(x - self.video_panel.x), int(y - self.video_panel.y))
+            for x, y in points
+        ]
 
     def draw_lane_view(self, app: RhythmPrototype) -> None:
         if not app.analysis:
@@ -330,6 +573,21 @@ class RhythmRenderer:
             48,
         )
 
+    def song_action_rect(self, row_offset: int) -> pygame.Rect:
+        row_rect = self.song_row_rect(row_offset)
+        return pygame.Rect(row_rect.right - 116, row_rect.y + 7, 96, 34)
+
+    def configure_library_controls(self, mode: str) -> None:
+        if mode == "home":
+            control_y = self.library_panel.bottom - 58
+            self.scroll_down_button.update(self.library_panel.right - 58, control_y + 3, 38, 32)
+            self.scroll_up_button.update(self.scroll_down_button.x - 46, control_y + 3, 38, 32)
+            self.home_start_button.update(self.scroll_up_button.x - 164, control_y, 150, 38)
+            return
+
+        self.scroll_up_button.update(self.library_panel.right - 92, self.library_panel.y + 18, 36, 32)
+        self.scroll_down_button.update(self.library_panel.right - 48, self.library_panel.y + 18, 36, 32)
+
     def song_index_from_position(
         self,
         library: SongLibrary,
@@ -340,6 +598,66 @@ class RhythmRenderer:
                 return song_index
 
         return None
+
+    def start_song_index_from_position(
+        self,
+        library: SongLibrary,
+        mouse_pos: tuple[int, int],
+    ) -> int | None:
+        if self.home_start_button.collidepoint(mouse_pos):
+            return library.selected_song_index
+
+        return None
+
+    def delete_song_index_from_position(
+        self,
+        library: SongLibrary,
+        mouse_pos: tuple[int, int],
+    ) -> int | None:
+        for row_offset, song_index in enumerate(library.visible_song_indices()):
+            if self.song_action_rect(row_offset).collidepoint(mouse_pos):
+                return song_index
+
+        return None
+
+    def load_background_image(self) -> pygame.Surface | None:
+        background_path = resource_path("assets", "cpdito", "FondoLoginRegistro.jpg.jpeg")
+        if not background_path.exists():
+            return None
+
+        try:
+            image = pygame.image.load(str(background_path)).convert()
+        except (FileNotFoundError, pygame.error):
+            return None
+        return cover_scale(image, (WINDOW_WIDTH, WINDOW_HEIGHT))
+
+    def load_lane_icons(self) -> list[pygame.Surface | None]:
+        icon_names = [
+            "Aplauso-CPD-FeriaSR.png",
+            "Chasquido-CPD-FeriaSR.png",
+            "Pecho-CPD-FeriaSR.png",
+            "Piso-CPD-FeriaSR.png",
+            "Sentadilla-CPD-FeriaSR.png",
+        ]
+        icons: list[pygame.Surface | None] = []
+        for icon_name in icon_names:
+            icon_path = resource_path("assets", "cpdito", icon_name)
+            if not icon_path.exists():
+                icons.append(None)
+                continue
+            try:
+                icon = pygame.image.load(str(icon_path)).convert_alpha()
+            except (FileNotFoundError, pygame.error):
+                icons.append(None)
+                continue
+            icons.append(cover_scale(icon, (86, 86)))
+        return icons
+
+    def load_video_loop(self) -> LoopingVideo | None:
+        video_path = resource_path("assets", "cpdito", "cpdito bailarín.mp4")
+        if not video_path.exists():
+            return None
+        return LoopingVideo(video_path, self.video_panel.size)
 
     @staticmethod
     def fit_text(text: str, font: pygame.font.Font, max_width: int) -> str:
@@ -373,6 +691,71 @@ class RhythmRenderer:
     @staticmethod
     def to_int_points(points: list[tuple[float, float]]) -> list[tuple[int, int]]:
         return [(int(x), int(y)) for x, y in points]
+
+    def draw_gradient_rect(
+        self,
+        rect: pygame.Rect,
+        left_color: tuple[int, int, int],
+        right_color: tuple[int, int, int],
+        border_radius: int = 0,
+    ) -> None:
+        gradient = pygame.Surface(rect.size, pygame.SRCALPHA)
+        for x_pos in range(max(1, rect.width)):
+            amount = x_pos / max(1, rect.width - 1)
+            color = tuple(
+                int(self.lerp(left, right, amount))
+                for left, right in zip(left_color, right_color)
+            )
+            pygame.draw.line(gradient, color, (x_pos, 0), (x_pos, rect.height))
+
+        mask = pygame.Surface(rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(mask, (255, 255, 255, 255), mask.get_rect(), border_radius=border_radius)
+        gradient.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        self.screen.blit(gradient, rect)
+
+    def draw_glass_rect(
+        self,
+        rect: pygame.Rect,
+        color: tuple[int, ...],
+        border_radius: int = 18,
+        border_alpha: int = 112,
+    ) -> None:
+        surface = pygame.Surface(rect.size, pygame.SRCALPHA)
+        fill = color if len(color) == 4 else (*color, 48)
+        pygame.draw.rect(surface, fill, surface.get_rect(), border_radius=border_radius)
+        pygame.draw.rect(
+            surface,
+            (255, 255, 255, border_alpha),
+            surface.get_rect(),
+            width=2,
+            border_radius=border_radius,
+        )
+        pygame.draw.line(
+            surface,
+            (255, 255, 255, min(160, border_alpha + 42)),
+            (border_radius, 5),
+            (rect.width - border_radius, 5),
+            2,
+        )
+        self.screen.blit(surface, rect)
+
+    def build_menu_scene_surface(self) -> pygame.Surface:
+        scene = self.background_image.copy() if self.background_image else pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+        top = (255, 84, 190)
+        mid = (111, 88, 255)
+        bottom = (34, 219, 229)
+
+        if self.background_image is None:
+            for y_pos in range(WINDOW_HEIGHT):
+                blend = y_pos / max(1, WINDOW_HEIGHT - 1)
+                if blend < 0.52:
+                    local_blend = blend / 0.52
+                    color = tuple(int(self.lerp(a, b, local_blend)) for a, b in zip(top, mid))
+                else:
+                    local_blend = (blend - 0.52) / 0.48
+                    color = tuple(int(self.lerp(a, b, local_blend)) for a, b in zip(mid, bottom))
+                pygame.draw.line(scene, color, (0, y_pos), (WINDOW_WIDTH, y_pos))
+        return scene
 
     def track_bounds_for_y(self, y: float) -> tuple[float, float]:
         clamped_progress = max(0.0, min(1.0, (y - LANE_TOP) / max(1, HIT_ZONE_Y - LANE_TOP)))
@@ -499,38 +882,29 @@ class RhythmRenderer:
 
     def draw_lane_receptor(self, surface: pygame.Surface, lane: int) -> None:
         lane_color = LANE_COLORS[lane]
-        center_y = HIT_ZONE_Y + 26
+        center_y = HIT_ZONE_Y + 28
         center_x = self.lane_center_for_y(lane, center_y)
-        points = [
-            (center_x, center_y + 36),
-            (center_x - 30, center_y + 8),
-            (center_x - 22, center_y - 28),
-            (center_x, center_y - 40),
-            (center_x + 22, center_y - 28),
-            (center_x + 30, center_y + 8),
-        ]
-        outer_glow = self.scale_polygon(points, 1.24, 1.18)
-        inner_face = self.scale_polygon(points, 0.84, 0.84)
-        highlight = [
-            (center_x, center_y - 28),
-            (center_x - 12, center_y + 6),
-            (center_x, center_y + 24),
-            (center_x + 12, center_y + 6),
-        ]
+        tile_rect = pygame.Rect(0, 0, 96, 96)
+        tile_rect.center = (int(center_x), int(center_y))
+        glow_rect = tile_rect.inflate(18, 18)
 
-        pygame.draw.polygon(surface, (*lane_color, 34), self.to_int_points(outer_glow))
-        pygame.draw.polygon(surface, (20, 28, 50, 228), self.to_int_points(points))
-        pygame.draw.polygon(surface, (*lane_color, 164), self.to_int_points(inner_face))
-        pygame.draw.polygon(surface, (255, 255, 255, 210), self.to_int_points(inner_face), 2)
-        pygame.draw.polygon(surface, (255, 255, 255, 72), self.to_int_points(highlight))
+        pygame.draw.rect(surface, (*lane_color, 52), glow_rect, border_radius=22)
+        pygame.draw.rect(surface, (10, 18, 48, 214), tile_rect, border_radius=18)
+        pygame.draw.rect(surface, (*lane_color, 132), tile_rect.inflate(-8, -8), border_radius=15)
+        pygame.draw.rect(surface, (255, 255, 255, 228), tile_rect, width=3, border_radius=18)
         pygame.draw.line(
             surface,
-            (255, 255, 255, 110),
-            (int(center_x), int(center_y - 28)),
-            (int(center_x), int(center_y + 21)),
+            (255, 255, 255, 142),
+            (tile_rect.x + 14, tile_rect.y + 10),
+            (tile_rect.right - 14, tile_rect.y + 10),
             2,
         )
-        self.draw_lane_emblem(surface, lane, (int(center_x), int(center_y + 1)))
+        icon = self.lane_icons[lane] if lane < len(self.lane_icons) else None
+        if icon is not None:
+            icon_rect = icon.get_rect(center=tile_rect.center)
+            surface.blit(icon, icon_rect)
+        else:
+            self.draw_lane_emblem(surface, lane, (int(center_x), int(center_y + 1)))
 
     def draw_note_gem(
         self,
@@ -560,31 +934,32 @@ class RhythmRenderer:
         pygame.draw.polygon(surface, (255, 255, 255, 228), self.to_int_points(points), 2)
 
     def build_visualizer_scene_surface(self) -> pygame.Surface:
-        scene = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
-        dawn_top = (6, 24, 94)
-        dawn_mid = (8, 58, 158)
-        night_bottom = (6, 10, 26)
+        scene = self.background_image.copy() if self.background_image else pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT))
+        dawn_top = (32, 20, 114)
+        dawn_mid = (255, 74, 181)
+        night_bottom = (12, 204, 216)
 
-        for y_pos in range(WINDOW_HEIGHT):
-            blend = y_pos / max(1, WINDOW_HEIGHT - 1)
-            if blend < 0.58:
-                local_blend = blend / 0.58
-                color = tuple(
-                    int(self.lerp(top, mid, local_blend))
-                    for top, mid in zip(dawn_top, dawn_mid)
-                )
-            else:
-                local_blend = (blend - 0.58) / 0.42
-                color = tuple(
-                    int(self.lerp(mid, bottom, local_blend))
-                    for mid, bottom in zip(dawn_mid, night_bottom)
-                )
-            pygame.draw.line(scene, color, (0, y_pos), (WINDOW_WIDTH, y_pos))
+        if self.background_image is None:
+            for y_pos in range(WINDOW_HEIGHT):
+                blend = y_pos / max(1, WINDOW_HEIGHT - 1)
+                if blend < 0.58:
+                    local_blend = blend / 0.58
+                    color = tuple(
+                        int(self.lerp(top, mid, local_blend))
+                        for top, mid in zip(dawn_top, dawn_mid)
+                    )
+                else:
+                    local_blend = (blend - 0.58) / 0.42
+                    color = tuple(
+                        int(self.lerp(mid, bottom, local_blend))
+                        for mid, bottom in zip(dawn_mid, night_bottom)
+                    )
+                pygame.draw.line(scene, color, (0, y_pos), (WINDOW_WIDTH, y_pos))
 
+        return scene
+
+    def build_lane_scene_surface(self) -> pygame.Surface:
         overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        pygame.draw.circle(overlay, (42, 128, 255, 76), (166, 92), 196)
-        pygame.draw.circle(overlay, (255, 82, 201, 58), (WINDOW_WIDTH - 130, 104), 172)
-        pygame.draw.circle(overlay, (255, 116, 92, 56), (WINDOW_WIDTH // 2 + 122, 216), 136)
 
         left_top, right_top = self.track_bounds_for_y(LANE_TOP + 10)
         left_bottom, right_bottom = self.track_bounds_for_y(HIT_ZONE_Y + 50)
@@ -594,47 +969,8 @@ class RhythmRenderer:
             (right_bottom, HIT_ZONE_Y + 50),
             (left_bottom, HIT_ZONE_Y + 50),
         ]
-        pygame.draw.polygon(overlay, (6, 10, 34, 118), self.to_int_points(track_shadow))
-        pygame.draw.polygon(overlay, (255, 255, 255, 22), self.to_int_points(track_shadow), 2)
-
-        hill_points = [
-            (self.lane_area.x + 90, HIT_ZONE_Y - 18),
-            (self.lane_area.x + 210, HIT_ZONE_Y - 120),
-            (self.lane_area.x + 340, HIT_ZONE_Y - 54),
-            (self.lane_area.x + 500, HIT_ZONE_Y - 138),
-            (self.lane_area.x + 700, HIT_ZONE_Y - 10),
-            (self.lane_area.x + 90, HIT_ZONE_Y - 10),
-        ]
-        pygame.draw.polygon(overlay, (7, 18, 34, 165), hill_points)
-
-        house_center_x = self.lane_area.centerx - 126
-        house_base_y = HIT_ZONE_Y - 66
-        house_body = pygame.Rect(house_center_x - 62, house_base_y - 54, 124, 54)
-        pygame.draw.rect(overlay, (15, 20, 24, 225), house_body)
-        roof_points = [
-            (house_body.left - 16, house_body.top + 10),
-            (house_center_x - 12, house_body.top - 48),
-            (house_body.right + 20, house_body.top + 10),
-            (house_body.right - 12, house_body.top + 18),
-        ]
-        pygame.draw.polygon(overlay, (11, 17, 19, 235), roof_points)
-        window_rect = pygame.Rect(house_center_x + 12, house_base_y - 34, 22, 22)
-        pygame.draw.rect(overlay, (255, 228, 148, 142), window_rect, border_radius=3)
-        pygame.draw.rect(overlay, (255, 245, 199, 84), window_rect.inflate(8, 8), border_radius=5)
-        for index in range(4):
-            smoke_center = (
-                house_center_x - 18 + index * 7,
-                house_base_y - 78 - index * 18,
-            )
-            pygame.draw.circle(overlay, (220, 232, 255, 34 - index * 5), smoke_center, 9 - index)
-
-        red_lane_x = self.lane_center_for_y(3, LANE_TOP)
-        for index in range(4):
-            ring_rect = pygame.Rect(0, 0, 54 - index * 6, 12)
-            ring_rect.center = (int(red_lane_x + index * 3), LANE_TOP - 58 + index * 34)
-            pygame.draw.ellipse(overlay, (255, 82, 92, 22), ring_rect.inflate(26, 18))
-            pygame.draw.ellipse(overlay, (255, 90, 102, 188), ring_rect, 3)
-            pygame.draw.ellipse(overlay, (255, 255, 255, 84), ring_rect.inflate(-18, -4), 1)
+        pygame.draw.polygon(overlay, (255, 255, 255, 34), self.to_int_points(track_shadow))
+        pygame.draw.polygon(overlay, (255, 255, 255, 94), self.to_int_points(track_shadow), 2)
 
         beam_top_y = 0
         beam_bottom_y = HIT_ZONE_Y + 18
@@ -656,15 +992,10 @@ class RhythmRenderer:
                 3,
             )
 
-        for particle_x, particle_y, radius, alpha in self.visualizer_particles:
-            pygame.draw.circle(overlay, (255, 255, 255, alpha), (particle_x, particle_y), radius)
-
         floor_glow = pygame.Rect(self.lane_area.x + 110, HIT_ZONE_Y - 6, self.lane_area.width - 220, 86)
-        pygame.draw.ellipse(overlay, (255, 255, 255, 18), floor_glow)
-        pygame.draw.ellipse(overlay, (255, 110, 120, 16), floor_glow.inflate(160, 30))
+        pygame.draw.ellipse(overlay, (255, 255, 255, 22), floor_glow)
 
         for lane in range(LANE_COUNT):
             self.draw_lane_receptor(overlay, lane)
 
-        scene.blit(overlay, (0, 0))
-        return scene
+        return overlay

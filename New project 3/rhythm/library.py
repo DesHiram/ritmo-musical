@@ -44,6 +44,21 @@ class SongLibrary:
         self.ensure_song_visible(index)
         return self.saved_songs[index]
 
+    def remove_song(self, index: int) -> tuple[SavedSong | None, str | None]:
+        if index < 0 or index >= len(self.saved_songs):
+            return None, None
+
+        removed_song = self.saved_songs.pop(index)
+        if not self.saved_songs:
+            self.selected_song_index = None
+            self.song_scroll = 0
+        else:
+            self.selected_song_index = min(index, len(self.saved_songs) - 1)
+            self.song_scroll = min(self.song_scroll, self.max_song_scroll())
+            self.ensure_song_visible(self.selected_song_index)
+
+        return removed_song, self.persist_saved_songs()
+
     def match_selection(self, file_path: Path) -> int | None:
         normalized_key = self.normalize_song_key(file_path)
         self.selected_song_index = None

@@ -8,8 +8,8 @@ Primera version funcional de un prototipo estilo Guitar Hero hecho con Python.
 - Apertura automatica de la pantalla de visualizacion al generar la pista
 - Biblioteca persistente de canciones en `saved_songs.json`
 - Vista con 5 carriles de colores
-- Analisis de onsets y tempo con `librosa`
-- Generacion automatica de notas con ritmo por onsets y carril por melodia
+- Analisis de melodia y tempo con `librosa`
+- Generacion automatica de notas usando solo la melodia de la cancion
 - Reproduccion de la musica mientras caen las notas
 - Boton para volver a reproducir la pista las veces que quieras
 - Zona de golpe al final de los carriles

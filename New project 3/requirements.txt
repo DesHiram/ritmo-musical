@@ -1,3 +1,5 @@
 pygame-ce
 librosa
 numpy
+imageio
+imageio-ffmpeg

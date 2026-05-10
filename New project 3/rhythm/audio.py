@@ -16,8 +16,9 @@ class TrackBuilder:
         if audio.size == 0:
             raise ValueError("El archivo no contiene audio utilizable.")
 
+        harmonic_audio, _ = librosa.effects.hpss(audio)
         onset_envelope = librosa.onset.onset_strength(
-            y=audio,
+            y=harmonic_audio,
             sr=sample_rate,
             hop_length=hop_length,
         )
@@ -26,33 +27,29 @@ class TrackBuilder:
             sr=sample_rate,
             hop_length=hop_length,
         )
-        event_frames = np.asarray(
-            librosa.onset.onset_detect(
-                onset_envelope=onset_envelope,
-                sr=sample_rate,
-                hop_length=hop_length,
-                backtrack=False,
-            ),
-            dtype=int,
-        )
 
-        if event_frames.size == 0:
-            raise ValueError("No se detectaron onsets utiles para construir la pista.")
-
-        event_times = librosa.frames_to_time(
-            event_frames,
-            sr=sample_rate,
-            hop_length=hop_length,
-        )
         melody_curve = self.extract_melody_curve(
-            audio=audio,
+            harmonic_audio=harmonic_audio,
             sample_rate=sample_rate,
             hop_length=hop_length,
         )
-        notes = self.assign_lanes(
-            event_frames=event_frames,
-            event_times=event_times,
+        melody_frames = self.build_melody_event_frames(
+            melody_curve=melody_curve,
             onset_envelope=onset_envelope,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+        )
+        if melody_frames.size < 8:
+            raise ValueError("No se detecto melodia suficiente para construir la pista.")
+
+        event_times = librosa.frames_to_time(
+            melody_frames,
+            sr=sample_rate,
+            hop_length=hop_length,
+        )
+        notes = self.assign_lanes(
+            event_frames=melody_frames,
+            event_times=event_times,
             melody_curve=melody_curve,
         )
         normalized_tempo = float(np.asarray(tempo).reshape(-1)[0])
@@ -60,11 +57,10 @@ class TrackBuilder:
 
     def extract_melody_curve(
         self,
-        audio: np.ndarray,
+        harmonic_audio: np.ndarray,
         sample_rate: int,
         hop_length: int,
     ) -> np.ndarray:
-        harmonic_audio, _ = librosa.effects.hpss(audio)
         dominant_curve = self.extract_dominant_pitch_curve(
             harmonic_audio=harmonic_audio,
             sample_rate=sample_rate,
@@ -96,8 +92,97 @@ class TrackBuilder:
         midi_values = librosa.hz_to_midi(f0)
         refined_curve = np.where(voiced_flag, midi_values, np.nan)
         voiced_pitch = np.isfinite(refined_curve)
-        melody_curve[: f0.size][voiced_pitch] = refined_curve[voiced_pitch]
+        melody_slice = melody_curve[: f0.size]
+        melody_slice[voiced_pitch] = refined_curve[voiced_pitch]
         return melody_curve
+
+    def build_melody_event_frames(
+        self,
+        melody_curve: np.ndarray,
+        onset_envelope: np.ndarray,
+        sample_rate: int,
+        hop_length: int,
+    ) -> np.ndarray:
+        if melody_curve.size == 0:
+            return np.array([], dtype=int)
+
+        finite_pitch = np.isfinite(melody_curve)
+        if np.count_nonzero(finite_pitch) < 8:
+            return np.array([], dtype=int)
+
+        smoothed_curve = self.smooth_melody_curve(melody_curve)
+        pitch_floor, pitch_ceiling = self.melody_range(smoothed_curve)
+        if pitch_ceiling <= pitch_floor:
+            return np.array([], dtype=int)
+
+        frame_seconds = hop_length / sample_rate
+        min_gap_frames = max(1, int(round(MIN_NOTE_SPACING / frame_seconds)))
+        sustain_gap_frames = max(min_gap_frames + 1, int(round(0.42 / frame_seconds)))
+        max_onset_strength = float(np.max(onset_envelope)) if onset_envelope.size else 0.0
+        accent_floor = max_onset_strength * 0.28
+
+        events: list[int] = []
+        previous_frame = -999_999
+        previous_lane: int | None = None
+        last_sustain_frame = -999_999
+
+        for frame, pitch_value in enumerate(smoothed_curve):
+            if not np.isfinite(pitch_value):
+                continue
+
+            lane = self.lane_for_pitch(
+                pitch_value=float(pitch_value),
+                pitch_floor=pitch_floor,
+                pitch_ceiling=pitch_ceiling,
+            )
+            has_lane_change = previous_lane is not None and lane != previous_lane
+            has_accent = self.is_local_onset_peak(frame, onset_envelope, accent_floor)
+            needs_sustain = frame - last_sustain_frame >= sustain_gap_frames
+
+            should_add = previous_lane is None or has_lane_change or has_accent or needs_sustain
+            if should_add and frame - previous_frame >= min_gap_frames:
+                events.append(frame)
+                previous_frame = frame
+                last_sustain_frame = frame
+
+            previous_lane = lane
+
+        return np.asarray(events, dtype=int)
+
+    def smooth_melody_curve(self, melody_curve: np.ndarray) -> np.ndarray:
+        finite_pitch = np.isfinite(melody_curve)
+        if np.count_nonzero(finite_pitch) < 2:
+            return melody_curve
+
+        frame_indices = np.arange(melody_curve.size)
+        interpolated = np.interp(
+            frame_indices,
+            frame_indices[finite_pitch],
+            melody_curve[finite_pitch],
+        )
+        window_size = 5
+        kernel = np.ones(window_size, dtype=float) / window_size
+        smoothed = np.convolve(interpolated, kernel, mode="same")
+        smoothed[~finite_pitch] = np.nan
+        return smoothed
+
+    def is_local_onset_peak(
+        self,
+        frame: int,
+        onset_envelope: np.ndarray,
+        accent_floor: float,
+    ) -> bool:
+        if onset_envelope.size == 0 or accent_floor <= 0.0:
+            return False
+
+        strength_index = min(frame, onset_envelope.size - 1)
+        strength = float(onset_envelope[strength_index])
+        if strength < accent_floor:
+            return False
+
+        start = max(0, strength_index - 1)
+        stop = min(onset_envelope.size, strength_index + 2)
+        return strength >= float(np.max(onset_envelope[start:stop]))
 
     def extract_dominant_pitch_curve(
         self,
@@ -129,14 +214,11 @@ class TrackBuilder:
         self,
         event_frames: np.ndarray,
         event_times: np.ndarray,
-        onset_envelope: np.ndarray,
         melody_curve: np.ndarray,
     ) -> list[NoteEvent]:
-        max_strength = float(np.max(onset_envelope)) if onset_envelope.size else 1.0
         pitch_floor, pitch_ceiling = self.melody_range(melody_curve)
 
         notes: list[NoteEvent] = []
-        previous_melodic_lane: int | None = None
         previous_time = -999.0
 
         for frame, event_time in zip(event_frames, event_times):
@@ -150,17 +232,8 @@ class TrackBuilder:
                 pitch_floor=pitch_floor,
                 pitch_ceiling=pitch_ceiling,
             )
-            if lane is None and previous_melodic_lane is not None:
-                lane = previous_melodic_lane
-
             if lane is None:
-                lane = self.intensity_lane_for_frame(
-                    frame=int(frame),
-                    onset_envelope=onset_envelope,
-                    max_strength=max_strength,
-                )
-            else:
-                previous_melodic_lane = lane
+                continue
 
             notes.append(NoteEvent(lane=lane, hit_time=hit_time))
             previous_time = hit_time
@@ -204,20 +277,21 @@ class TrackBuilder:
             return LANE_COUNT // 2
 
         normalized = (pitch_value - pitch_floor) / (pitch_ceiling - pitch_floor)
+        return self.lane_for_normalized_pitch(normalized)
+
+    def lane_for_pitch(
+        self,
+        pitch_value: float,
+        pitch_floor: float,
+        pitch_ceiling: float,
+    ) -> int:
+        if pitch_ceiling <= pitch_floor:
+            return LANE_COUNT // 2
+
+        normalized = (pitch_value - pitch_floor) / (pitch_ceiling - pitch_floor)
+        return self.lane_for_normalized_pitch(normalized)
+
+    def lane_for_normalized_pitch(self, normalized: float) -> int:
         normalized = float(np.clip(normalized, 0.0, 1.0))
         lane = int(np.rint(normalized * (LANE_COUNT - 1)))
         return min(LANE_COUNT - 1, max(0, lane))
-
-    def intensity_lane_for_frame(
-        self,
-        frame: int,
-        onset_envelope: np.ndarray,
-        max_strength: float,
-    ) -> int:
-        if not onset_envelope.size or max_strength <= 0.0:
-            return LANE_COUNT // 2
-
-        strength_index = min(frame, onset_envelope.size - 1)
-        strength = float(onset_envelope[strength_index])
-        normalized = float(np.clip(strength / max_strength, 0.0, 1.0))
-        return min(LANE_COUNT - 1, int(normalized * LANE_COUNT))
