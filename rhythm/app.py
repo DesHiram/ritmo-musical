@@ -31,7 +31,9 @@ class RhythmPrototype:
         pygame.mixer.init()
         pygame.display.set_caption(APP_TITLE)
 
-        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+        self.window = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        self.screen = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT)).convert()
+        self.display_rect = self.calculate_display_rect()
         self.set_window_icon()
         self.clock = pygame.time.Clock()
         self.title_font = pygame.font.SysFont("arial", 30, bold=True)
@@ -97,7 +99,9 @@ class RhythmPrototype:
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    self.handle_click(event.pos)
+                    logical_pos = self.to_logical_pos(event.pos)
+                    if logical_pos is not None:
+                        self.handle_click(logical_pos)
                 elif event.type == pygame.MOUSEWHEEL and self.current_screen in {"home", "settings"}:
                     self.library.scroll_song_list(-event.y)
                 elif event.type == pygame.KEYDOWN:
@@ -105,11 +109,37 @@ class RhythmPrototype:
 
             self.update_playback_state()
             self.draw()
-            pygame.display.flip()
+            self.present_frame()
 
         pygame.mixer.music.stop()
         self.tk_root.destroy()
         pygame.quit()
+
+    def calculate_display_rect(self) -> pygame.Rect:
+        window_width, window_height = self.window.get_size()
+        scale = min(window_width / WINDOW_WIDTH, window_height / WINDOW_HEIGHT)
+        scaled_width = round(WINDOW_WIDTH * scale)
+        scaled_height = round(WINDOW_HEIGHT * scale)
+        return pygame.Rect(
+            (window_width - scaled_width) // 2,
+            (window_height - scaled_height) // 2,
+            scaled_width,
+            scaled_height,
+        )
+
+    def to_logical_pos(self, mouse_pos: tuple[int, int]) -> tuple[int, int] | None:
+        if not self.display_rect.collidepoint(mouse_pos):
+            return None
+
+        logical_x = (mouse_pos[0] - self.display_rect.x) * WINDOW_WIDTH / self.display_rect.width
+        logical_y = (mouse_pos[1] - self.display_rect.y) * WINDOW_HEIGHT / self.display_rect.height
+        return round(logical_x), round(logical_y)
+
+    def present_frame(self) -> None:
+        self.window.fill((0, 0, 0))
+        scaled_screen = pygame.transform.smoothscale(self.screen, self.display_rect.size)
+        self.window.blit(scaled_screen, self.display_rect)
+        pygame.display.flip()
 
     def handle_keydown(self, key: int) -> None:
         if self.current_screen != "game":
@@ -338,7 +368,7 @@ class RhythmPrototype:
         self.stop_playback()
         self.status_message = "Analizando audio y generando pista..."
         self.draw()
-        pygame.display.flip()
+        self.present_frame()
         pygame.event.pump()
 
         cache_key = self.normalize_song_key(self.selected_file)
@@ -494,12 +524,14 @@ class RhythmPrototype:
 
     def update_playback_state(self) -> None:
         if self.is_playing and not self.is_paused and not pygame.mixer.music.get_busy():
+            if self.analysis and self.analysis_source and self.analysis_source.exists():
+                if self.start_playback():
+                    self.status_message = f"Reproduciendo en loop: {self.analysis_source.stem}"
+                return
+
             self.is_playing = False
             self.playback_started_at = 0.0
-            if self.analysis:
-                self.status_message = (
-                    "Reproduccion finalizada. Puedes volver a reproducir la pista cuando quieras."
-                )
+            self.status_message = "La pista no pudo reiniciarse porque el archivo ya no esta disponible."
 
     def current_song_time(self) -> float:
         if not self.is_playing:
