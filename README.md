@@ -28,6 +28,7 @@ pip install -r requirements.txt
 
 ```bash
 python main.py
+.\.venv\Scripts\python main.py
 ```
 
 Nota: en esta configuracion uso `pygame-ce`, que mantiene `import pygame` y evita problemas de compatibilidad que puede tener `pygame` clasico con Python 3.14 en Windows.
