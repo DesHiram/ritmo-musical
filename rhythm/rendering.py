@@ -234,18 +234,18 @@ class RhythmRenderer:
         if self.header_logo is not None:
             max_logo_size = (300, 76) if not section else (220, 52)
             logo = self.scale_to_fit(self.header_logo, max_logo_size)
-            logo_rect = logo.get_rect(center=(header.centerx, title_y))
+            logo_rect = logo.get_rect(midleft=(header.x + 22, title_y))
             self.screen.blit(logo, logo_rect)
         else:
             glow = self.header_title_font.render(APP_TITLE, True, (255, 78, 206))
             title = self.header_title_font.render(APP_TITLE, True, TEXT_COLOR)
-            glow_rect = glow.get_rect(center=(header.centerx + 4, title_y + 4))
-            title_rect = title.get_rect(center=(header.centerx, title_y))
+            glow_rect = glow.get_rect(midleft=(header.x + 26, title_y + 4))
+            title_rect = title.get_rect(midleft=(header.x + 22, title_y))
             self.screen.blit(glow, glow_rect)
             self.screen.blit(title, title_rect)
         if section:
             subtitle = self.small_font.render(section.upper(), True, MUTED_TEXT)
-            subtitle_rect = subtitle.get_rect(center=(header.centerx, header.y + 66))
+            subtitle_rect = subtitle.get_rect(midleft=(header.x + 22, header.y + 66))
             self.screen.blit(subtitle, subtitle_rect)
 
         count_text = self.small_font.render(
@@ -656,9 +656,6 @@ class RhythmRenderer:
         else:
             video_surface.fill((255, 255, 255, 18))
 
-        mask = pygame.Surface(self.video_panel.size, pygame.SRCALPHA)
-        pygame.draw.polygon(mask, (255, 255, 255, 255), self.video_mask_points())
-        video_surface.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
         self.screen.blit(video_surface, self.video_panel)
 
     def video_mask_points(self) -> list[tuple[int, int]]:
