@@ -9,3 +9,4 @@ __pycache__/
 venv/
 .env
 saved_songs.*.json
+generation_errors.log

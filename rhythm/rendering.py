@@ -349,6 +349,23 @@ class RhythmRenderer:
         helper = self.small_font.render(helper_text, True, MUTED_TEXT)
         self.screen.blit(title, (self.library_panel.x + 20, self.library_panel.y + 16))
         self.screen.blit(helper, (self.library_panel.x + 20, self.library_panel.y + 42))
+        if mode == "home":
+            status_rect = pygame.Rect(
+                self.library_panel.x + 20,
+                self.library_panel.bottom - 54,
+                self.library_panel.width - 40,
+                36,
+            )
+            status_surface = pygame.Surface(status_rect.size, pygame.SRCALPHA)
+            pygame.draw.rect(status_surface, (12, 15, 38, 118), status_surface.get_rect(), border_radius=12)
+            pygame.draw.rect(status_surface, (255, 255, 255, 78), status_surface.get_rect(), width=1, border_radius=12)
+            self.screen.blit(status_surface, status_rect)
+            status_text = self.small_font.render(
+                self.fit_text(app.status_message, self.small_font, status_rect.width - 24),
+                True,
+                TEXT_COLOR,
+            )
+            self.screen.blit(status_text, status_text.get_rect(midleft=(status_rect.x + 12, status_rect.centery)))
 
         self.draw_button(
             self.scroll_up_button,

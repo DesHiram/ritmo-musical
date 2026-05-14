@@ -12,6 +12,7 @@ Primera version funcional de un prototipo estilo Guitar Hero hecho con Python.
 - Generacion automatica de notas usando melodia, BPM y beats principales
 - Exportacion de mapas de notas en JSON dentro de `beatmaps/`
 - Reproduccion de la musica mientras caen las notas
+- Reproduccion continua del repertorio: al terminar una cancion sigue la de abajo y vuelve arriba al final
 - Boton para volver a reproducir la pista las veces que quieras
 - Zona de golpe al final de los carriles
 
@@ -106,7 +107,7 @@ pyinstaller --clean CPDitoHero.spec
 1. En la pantalla principal pulsa `Subir audio` o elige una cancion guardada.
 2. Pulsa `Generar pista`.
 3. La app exportara el mapa JSON, abrira la pantalla de visualizacion y empezara la reproduccion.
-4. Cuando termine, puedes usar `Reproducir otra vez` para escuchar la misma pista sin regenerarla.
+4. Cuando termine, la app seguira con la siguiente cancion del repertorio; si llega al final vuelve a la primera.
 5. Usa `Volver` para regresar a la biblioteca y elegir otra cancion.
 
 ## Formato del mapa JSON

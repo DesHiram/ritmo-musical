@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import gc
 import json
 import platform
 from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog
 
@@ -23,7 +28,7 @@ from .constants import (
     WINDOW_WIDTH,
 )
 from .library import SongLibrary
-from .models import TrackAnalysis
+from .models import NoteEvent, TrackAnalysis
 from .rendering import RhythmRenderer, resource_path
 
 
@@ -65,8 +70,13 @@ class RhythmPrototype:
         self.analysis: TrackAnalysis | None = None
         self.analysis_cache: dict[str, TrackAnalysis] = {}
         self.status_message = self.library.warning or "Elige una cancion del repertorio para iniciar."
+        self.generation_queue: queue.Queue[tuple[Path, TrackAnalysis | None, str | None]] = queue.Queue()
+        self.generation_thread: threading.Thread | None = None
+        self.generation_source: Path | None = None
+        self.generation_started_at = 0.0
         self.is_playing = False
         self.is_paused = False
+        self.repertoire_loop_enabled = False
         self.playback_started_at = 0.0
         self.pause_started_at = 0.0
         self.paused_seconds = 0.0
@@ -110,6 +120,7 @@ class RhythmPrototype:
                     self.handle_keydown(event.key)
 
             self.update_playback_state()
+            self.update_generation_state()
             self.draw()
             self.present_frame()
 
@@ -119,15 +130,7 @@ class RhythmPrototype:
 
     def calculate_display_rect(self) -> pygame.Rect:
         window_width, window_height = self.window.get_size()
-        scale = min(window_width / WINDOW_WIDTH, window_height / WINDOW_HEIGHT)
-        scaled_width = round(WINDOW_WIDTH * scale)
-        scaled_height = round(WINDOW_HEIGHT * scale)
-        return pygame.Rect(
-            (window_width - scaled_width) // 2,
-            (window_height - scaled_height) // 2,
-            scaled_width,
-            scaled_height,
-        )
+        return pygame.Rect(0, 0, window_width, window_height)
 
     def to_logical_pos(self, mouse_pos: tuple[int, int]) -> tuple[int, int] | None:
         if not self.display_rect.collidepoint(mouse_pos):
@@ -138,7 +141,9 @@ class RhythmPrototype:
         return round(logical_x), round(logical_y)
 
     def present_frame(self) -> None:
-        self.window.fill((0, 0, 0))
+        if self.display_rect.size != self.window.get_size():
+            self.display_rect = self.calculate_display_rect()
+
         scaled_screen = pygame.transform.smoothscale(self.screen, self.display_rect.size)
         self.window.blit(scaled_screen, self.display_rect)
         pygame.display.flip()
@@ -235,6 +240,10 @@ class RhythmPrototype:
                 self.pause_track()
 
     def start_song_from_library(self, index: int) -> None:
+        if self.is_generating_track():
+            self.status_message = "Espera a que termine la generacion actual."
+            return
+
         song = self.library.select_song(index)
         if song is None:
             return
@@ -244,6 +253,7 @@ class RhythmPrototype:
             self.status_message = f"La cancion '{song.display_name}' ya no se encuentra en disco."
             return
 
+        self.repertoire_loop_enabled = True
         self.generate_track()
 
     def delete_saved_song(self, index: int) -> None:
@@ -278,6 +288,7 @@ class RhythmPrototype:
 
         save_error = self.library.clear_songs()
         self.stop_playback()
+        self.repertoire_loop_enabled = False
         self.selected_file = None
         self.analysis_source = None
         self.analysis = None
@@ -311,6 +322,7 @@ class RhythmPrototype:
 
     def exit_to_home(self) -> None:
         self.stop_playback()
+        self.repertoire_loop_enabled = False
         self.current_screen = "home"
         self.status_message = "Elige una cancion del repertorio para iniciar."
 
@@ -330,6 +342,10 @@ class RhythmPrototype:
             self.return_to_setup()
 
     def select_audio_file(self) -> None:
+        if self.is_generating_track():
+            self.status_message = "Espera a que termine la generacion antes de subir otra cancion."
+            return
+
         file_path = self.open_audio_file_dialog()
 
         if not file_path:
@@ -428,6 +444,10 @@ class RhythmPrototype:
         return file_path
 
     def generate_track(self) -> None:
+        if self.is_generating_track():
+            self.status_message = "Ya estoy generando una pista. Espera un momento."
+            return
+
         if not self.selected_file:
             self.status_message = "Primero sube un archivo de audio o elige una cancion guardada."
             return
@@ -437,26 +457,104 @@ class RhythmPrototype:
             return
 
         self.stop_playback()
-        self.status_message = "Analizando audio y generando pista..."
+        cache_key = self.normalize_song_key(self.selected_file)
+        cached_analysis = self.analysis_cache.get(cache_key)
+        if cached_analysis is not None:
+            self.finish_generated_track(self.selected_file, cached_analysis, from_cache=True)
+            return
+
+        existing_analysis = self.load_beatmap(self.selected_file)
+        if existing_analysis is not None:
+            self.analysis_cache[cache_key] = existing_analysis
+            self.finish_generated_track(self.selected_file, existing_analysis, from_cache=True)
+            return
+
+        self.status_message = "Analizando audio y generando pista... puede tardar en Raspberry."
         self.draw()
         self.present_frame()
         pygame.event.pump()
 
-        cache_key = self.normalize_song_key(self.selected_file)
-        from_cache = cache_key in self.analysis_cache
+        source_file = self.selected_file
+        self.generation_source = source_file
+        self.generation_started_at = time.monotonic()
+        self.generation_thread = threading.Thread(
+            target=self.build_track_in_background,
+            args=(source_file,),
+            daemon=True,
+        )
+        self.generation_thread.start()
+
+    def is_generating_track(self) -> bool:
+        return self.generation_thread is not None
+
+    def build_track_in_background(self, source_file: Path) -> None:
+        analysis: TrackAnalysis | None = None
+        error_message: str | None = None
 
         try:
-            analysis = self.analysis_cache.get(cache_key)
-            if analysis is None:
-                analysis = self.track_builder.build_chart(self.selected_file)
-                self.analysis_cache[cache_key] = analysis
+            analysis = self.track_builder.build_chart(source_file)
+            if not analysis.notes:
+                raise ValueError("No se encontraron beats utiles.")
+        except Exception as exc:  # pragma: no cover - background UI path
+            error_message = str(exc)
+            self.write_generation_error_log(source_file, exc)
+        finally:
+            gc.collect()
 
+        self.generation_queue.put((source_file, analysis, error_message))
+
+    def update_generation_state(self) -> None:
+        if self.generation_thread is None:
+            return
+
+        try:
+            source_file, analysis, error_message = self.generation_queue.get_nowait()
+        except queue.Empty:
+            if not self.generation_thread.is_alive():
+                self.generation_thread = None
+                self.generation_source = None
+                self.generation_started_at = 0.0
+                self.status_message = "La generacion se detuvo sin entregar resultado."
+                return
+
+            elapsed_seconds = max(0, int(time.monotonic() - self.generation_started_at))
+            dots = "." * ((elapsed_seconds % 3) + 1)
+            current_name = self.generation_source.stem if self.generation_source else "la cancion"
+            self.status_message = f"Analizando {current_name}{dots} {elapsed_seconds}s"
+            return
+
+        self.generation_thread = None
+        self.generation_source = None
+        self.generation_started_at = 0.0
+
+        if analysis is None:
+            detail = error_message or "Error desconocido."
+            self.status_message = f"No se pudo generar la pista: {detail}"
+            return
+
+        cache_key = self.normalize_song_key(source_file)
+        self.analysis_cache[cache_key] = analysis
+        self.finish_generated_track(source_file, analysis, from_cache=False)
+
+    def finish_generated_track(
+        self,
+        source_file: Path,
+        analysis: TrackAnalysis,
+        from_cache: bool,
+    ) -> None:
+        if not source_file.exists():
+            self.status_message = "La cancion seleccionada ya no se encuentra en disco."
+            return
+
+        try:
             if not analysis.notes:
                 raise ValueError("No se encontraron beats utiles.")
 
-            beatmap_path = self.export_beatmap(self.selected_file, analysis)
+            beatmap_path = self.export_beatmap(source_file, analysis)
             self.analysis = analysis
-            self.analysis_source = self.selected_file
+            self.analysis_source = source_file
+            self.selected_file = source_file
+            self.match_saved_song_selection(source_file)
             self.current_screen = "game"
 
             if not self.start_playback():
@@ -470,15 +568,48 @@ class RhythmPrototype:
         except Exception as exc:  # pragma: no cover - UI path
             self.status_message = f"No se pudo generar la pista: {exc}"
 
+    def beatmap_path_for_audio(self, audio_file: Path) -> Path:
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", audio_file.stem).strip("._")
+        if not safe_stem:
+            safe_stem = "cancion"
+        return self.project_root / BEATMAPS_DIR / f"{safe_stem}.json"
+
+    def load_beatmap(self, audio_file: Path) -> TrackAnalysis | None:
+        beatmap_path = self.beatmap_path_for_audio(audio_file)
+        if not beatmap_path.exists():
+            return None
+
+        try:
+            payload = json.loads(beatmap_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(payload, list):
+            return None
+
+        notes = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                hit_time = float(item["time"])
+                lane = int(item["lane"]) - 1
+                duration = float(item.get("duration") or 0.0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 <= lane < 5 and hit_time >= 0:
+                notes.append(NoteEvent(lane=lane, hit_time=hit_time, duration=duration))
+
+        if not notes:
+            return None
+
+        return TrackAnalysis(tempo=120.0, notes=sorted(notes, key=lambda note: (note.hit_time, note.lane)))
+
     def export_beatmap(self, audio_file: Path, analysis: TrackAnalysis) -> Path:
         beatmaps_dir = self.project_root / BEATMAPS_DIR
         beatmaps_dir.mkdir(parents=True, exist_ok=True)
 
-        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", audio_file.stem).strip("._")
-        if not safe_stem:
-            safe_stem = "cancion"
-
-        beatmap_path = beatmaps_dir / f"{safe_stem}.json"
+        beatmap_path = self.beatmap_path_for_audio(audio_file)
         payload = [
             {
                 "time": round(note.hit_time, 3),
@@ -490,12 +621,27 @@ class RhythmPrototype:
         beatmap_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return beatmap_path
 
+    def write_generation_error_log(self, source_file: Path, exc: Exception) -> None:
+        log_path = self.project_root / "generation_errors.log"
+        message = (
+            f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {source_file}\n"
+            f"{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))}\n"
+        )
+        try:
+            log_path.write_text(
+                (log_path.read_text(encoding="utf-8") if log_path.exists() else "") + message,
+                encoding="utf-8",
+            )
+        except OSError:
+            return
+
     def open_visualizer(self) -> None:
         if not self.is_selected_track_ready():
             self.status_message = "Genera la pista primero para abrir la visualizacion."
             return
 
         self.stop_playback()
+        self.repertoire_loop_enabled = False
         self.current_screen = "game"
         self.status_message = (
             "Visualizacion lista. Pulsa 'Reproducir otra vez' para escuchar la pista."
@@ -508,12 +654,14 @@ class RhythmPrototype:
 
         self.selected_file = self.analysis_source
         self.match_saved_song_selection(self.analysis_source)
+        self.repertoire_loop_enabled = True
 
         if self.start_playback():
             self.status_message = f"Reproduciendo: {self.analysis_source.stem}"
 
     def return_to_setup(self) -> None:
         self.stop_playback()
+        self.repertoire_loop_enabled = False
         self.current_screen = "home"
 
         if self.analysis_source:
@@ -595,14 +743,50 @@ class RhythmPrototype:
 
     def update_playback_state(self) -> None:
         if self.is_playing and not self.is_paused and not pygame.mixer.music.get_busy():
-            if self.analysis and self.analysis_source and self.analysis_source.exists():
-                if self.start_playback():
-                    self.status_message = f"Reproduciendo en loop: {self.analysis_source.stem}"
-                return
-
             self.is_playing = False
             self.playback_started_at = 0.0
+
+            if self.repertoire_loop_enabled and self.start_next_repertoire_song():
+                return
+
+            if self.analysis and self.analysis_source and self.analysis_source.exists():
+                if self.start_playback():
+                    self.status_message = f"Reproduciendo otra vez: {self.analysis_source.stem}"
+                return
+
             self.status_message = "La pista no pudo reiniciarse porque el archivo ya no esta disponible."
+
+    def start_next_repertoire_song(self) -> bool:
+        if not self.library.saved_songs:
+            return False
+
+        current_index = self.library.selected_song_index
+        if self.analysis_source:
+            matched_index = self.library.match_selection(self.analysis_source)
+            if matched_index is not None:
+                current_index = matched_index
+
+        if current_index is None:
+            current_index = -1
+
+        total_songs = len(self.library.saved_songs)
+        for offset in range(1, total_songs + 1):
+            next_index = (current_index + offset) % total_songs
+            next_song = self.library.select_song(next_index)
+            if next_song is None:
+                continue
+
+            next_file = Path(next_song.path)
+            if not next_file.exists():
+                continue
+
+            self.selected_file = next_file
+            self.status_message = f"Sigue en el repertorio: {next_song.display_name}"
+            self.generate_track()
+            return True
+
+        self.status_message = "No encontre otra cancion disponible en el repertorio."
+        return False
 
     def current_song_time(self) -> float:
         if not self.is_playing:
