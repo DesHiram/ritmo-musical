@@ -22,6 +22,7 @@ from .constants import (
     APP_TITLE,
     BEATMAPS_DIR,
     FPS,
+    LANE_COUNT,
     LEGACY_LIBRARY_FILENAME,
     LIBRARY_FILENAME_TEMPLATE,
     WINDOW_HEIGHT,
@@ -460,13 +461,17 @@ class RhythmPrototype:
         cache_key = self.normalize_song_key(self.selected_file)
         cached_analysis = self.analysis_cache.get(cache_key)
         if cached_analysis is not None:
-            self.finish_generated_track(self.selected_file, cached_analysis, from_cache=True)
+            started = self.finish_generated_track(self.selected_file, cached_analysis, from_cache=True)
+            if not started and self.repertoire_loop_enabled:
+                self.start_next_repertoire_song(after_file=self.selected_file)
             return
 
         existing_analysis = self.load_beatmap(self.selected_file)
         if existing_analysis is not None:
             self.analysis_cache[cache_key] = existing_analysis
-            self.finish_generated_track(self.selected_file, existing_analysis, from_cache=True)
+            started = self.finish_generated_track(self.selected_file, existing_analysis, from_cache=True)
+            if not started and self.repertoire_loop_enabled:
+                self.start_next_repertoire_song(after_file=self.selected_file)
             return
 
         self.status_message = "Analizando audio y generando pista... puede tardar en Raspberry."
@@ -475,6 +480,7 @@ class RhythmPrototype:
         pygame.event.pump()
 
         source_file = self.selected_file
+        self.clear_generation_queue()
         self.generation_source = source_file
         self.generation_started_at = time.monotonic()
         self.generation_thread = threading.Thread(
@@ -496,12 +502,19 @@ class RhythmPrototype:
             if not analysis.notes:
                 raise ValueError("No se encontraron beats utiles.")
         except Exception as exc:  # pragma: no cover - background UI path
-            error_message = str(exc)
+            error_message = str(exc) or exc.__class__.__name__
             self.write_generation_error_log(source_file, exc)
         finally:
             gc.collect()
 
         self.generation_queue.put((source_file, analysis, error_message))
+
+    def clear_generation_queue(self) -> None:
+        while True:
+            try:
+                self.generation_queue.get_nowait()
+            except queue.Empty:
+                return
 
     def update_generation_state(self) -> None:
         if self.generation_thread is None:
@@ -529,22 +542,34 @@ class RhythmPrototype:
 
         if analysis is None:
             detail = error_message or "Error desconocido."
-            self.status_message = f"No se pudo generar la pista: {detail}"
+            fallback_analysis = self.build_basic_fallback_track(source_file)
+            self.analysis_cache[self.normalize_song_key(source_file)] = fallback_analysis
+            started = self.finish_generated_track(
+                source_file,
+                fallback_analysis,
+                from_cache=False,
+                fallback_reason=detail,
+            )
+            if not started and self.repertoire_loop_enabled:
+                self.start_next_repertoire_song(after_file=source_file)
             return
 
         cache_key = self.normalize_song_key(source_file)
         self.analysis_cache[cache_key] = analysis
-        self.finish_generated_track(source_file, analysis, from_cache=False)
+        started = self.finish_generated_track(source_file, analysis, from_cache=False)
+        if not started and self.repertoire_loop_enabled:
+            self.start_next_repertoire_song(after_file=source_file)
 
     def finish_generated_track(
         self,
         source_file: Path,
         analysis: TrackAnalysis,
         from_cache: bool,
-    ) -> None:
+        fallback_reason: str | None = None,
+    ) -> bool:
         if not source_file.exists():
             self.status_message = "La cancion seleccionada ya no se encuentra en disco."
-            return
+            return False
 
         try:
             if not analysis.notes:
@@ -558,15 +583,46 @@ class RhythmPrototype:
             self.current_screen = "game"
 
             if not self.start_playback():
-                return
+                return False
 
             source_label = "lista" if from_cache else "generada"
+            if fallback_reason:
+                source_label = "basica"
             self.status_message = (
                 f"Pista {source_label}: {len(self.analysis.notes)} notas | "
                 f"{self.analysis.tempo:.1f} BPM | JSON: {beatmap_path.name}"
             )
+            return True
         except Exception as exc:  # pragma: no cover - UI path
             self.status_message = f"No se pudo generar la pista: {exc}"
+            return False
+
+    def build_basic_fallback_track(self, source_file: Path) -> TrackAnalysis:
+        duration = self.audio_duration_seconds(source_file)
+        tempo = 100.0
+        interval = 60.0 / tempo
+        pattern = [0, 2, 4, 1, 3, 2]
+        notes: list[NoteEvent] = []
+        hit_time = 1.0
+        pattern_index = 0
+
+        while hit_time < max(2.0, duration - 0.4):
+            lane = pattern[pattern_index % len(pattern)] % LANE_COUNT
+            notes.append(NoteEvent(lane=lane, hit_time=round(hit_time, 3)))
+            hit_time += interval
+            pattern_index += 1
+
+        if not notes:
+            notes.append(NoteEvent(lane=LANE_COUNT // 2, hit_time=1.0))
+
+        return TrackAnalysis(tempo=tempo, notes=notes)
+
+    def audio_duration_seconds(self, source_file: Path) -> float:
+        try:
+            sound = pygame.mixer.Sound(str(source_file))
+            return max(2.0, float(sound.get_length()))
+        except Exception:
+            return 180.0
 
     def beatmap_path_for_audio(self, audio_file: Path) -> Path:
         safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", audio_file.stem).strip("._")
@@ -718,6 +774,14 @@ class RhythmPrototype:
             return False
 
         try:
+            if audio_file.stat().st_size <= 0:
+                self.status_message = "El archivo de audio esta vacio. Vuelve a subir o descargar esa cancion."
+                return False
+        except OSError:
+            self.status_message = "No se pudo leer el archivo de audio."
+            return False
+
+        try:
             pygame.mixer.music.stop()
             pygame.mixer.music.load(str(audio_file))
             pygame.mixer.music.play()
@@ -756,13 +820,14 @@ class RhythmPrototype:
 
             self.status_message = "La pista no pudo reiniciarse porque el archivo ya no esta disponible."
 
-    def start_next_repertoire_song(self) -> bool:
+    def start_next_repertoire_song(self, after_file: Path | None = None) -> bool:
         if not self.library.saved_songs:
             return False
 
         current_index = self.library.selected_song_index
-        if self.analysis_source:
-            matched_index = self.library.match_selection(self.analysis_source)
+        reference_file = after_file or self.analysis_source
+        if reference_file:
+            matched_index = self.library.match_selection(reference_file)
             if matched_index is not None:
                 current_index = matched_index
 
@@ -778,6 +843,11 @@ class RhythmPrototype:
 
             next_file = Path(next_song.path)
             if not next_file.exists():
+                continue
+            try:
+                if next_file.stat().st_size <= 0:
+                    continue
+            except OSError:
                 continue
 
             self.selected_file = next_file
