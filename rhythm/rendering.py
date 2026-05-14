@@ -177,9 +177,9 @@ class RhythmRenderer:
 
         self.lane_area = pygame.Rect(74, LANE_TOP, 852, LANE_BOTTOM - LANE_TOP)
         self.video_panel = pygame.Rect(
-            self.lane_area.x + 24,
+            0,
             LANE_TOP + 10,
-            self.lane_area.width - 48,
+            WINDOW_WIDTH,
             HIT_ZONE_Y + 58 - (LANE_TOP + 10),
         )
         self.background_image = self.load_background_image()
@@ -234,18 +234,18 @@ class RhythmRenderer:
         if self.header_logo is not None:
             max_logo_size = (300, 76) if not section else (220, 52)
             logo = self.scale_to_fit(self.header_logo, max_logo_size)
-            logo_rect = logo.get_rect(midleft=(header.x + 22, title_y))
+            logo_rect = logo.get_rect(center=(header.centerx, title_y))
             self.screen.blit(logo, logo_rect)
         else:
             glow = self.header_title_font.render(APP_TITLE, True, (255, 78, 206))
             title = self.header_title_font.render(APP_TITLE, True, TEXT_COLOR)
-            glow_rect = glow.get_rect(midleft=(header.x + 26, title_y + 4))
-            title_rect = title.get_rect(midleft=(header.x + 22, title_y))
+            glow_rect = glow.get_rect(center=(header.centerx + 4, title_y + 4))
+            title_rect = title.get_rect(center=(header.centerx, title_y))
             self.screen.blit(glow, glow_rect)
             self.screen.blit(title, title_rect)
         if section:
             subtitle = self.small_font.render(section.upper(), True, MUTED_TEXT)
-            subtitle_rect = subtitle.get_rect(midleft=(header.x + 22, header.y + 66))
+            subtitle_rect = subtitle.get_rect(center=(header.centerx, header.y + 66))
             self.screen.blit(subtitle, subtitle_rect)
 
         count_text = self.small_font.render(
@@ -533,6 +533,7 @@ class RhythmRenderer:
         self.draw_video_panel(app)
         self.screen.blit(self.lane_scene, (0, 0))
         self.draw_lane_view(app)
+        self.draw_game_logo()
         self.draw_button(self.pause_button, "||", True, font=self.body_font)
 
         if app.is_paused:
@@ -652,25 +653,20 @@ class RhythmRenderer:
         video_surface = pygame.Surface(self.video_panel.size, pygame.SRCALPHA)
         if frame is not None:
             video_surface.blit(frame, (0, 0))
-            video_surface.set_alpha(145)
+            video_surface.set_alpha(77)
         else:
             video_surface.fill((255, 255, 255, 18))
 
         self.screen.blit(video_surface, self.video_panel)
 
-    def video_mask_points(self) -> list[tuple[int, int]]:
-        left_top, right_top = self.track_bounds_for_y(LANE_TOP + 10)
-        left_bottom, right_bottom = self.track_bounds_for_y(HIT_ZONE_Y + 50)
-        points = [
-            (left_top, LANE_TOP + 10),
-            (right_top, LANE_TOP + 10),
-            (right_bottom, HIT_ZONE_Y + 50),
-            (left_bottom, HIT_ZONE_Y + 50),
-        ]
-        return [
-            (int(x - self.video_panel.x), int(y - self.video_panel.y))
-            for x, y in points
-        ]
+    def draw_game_logo(self) -> None:
+        if self.header_logo is None:
+            title = self.title_font.render(APP_TITLE, True, TEXT_COLOR)
+            self.screen.blit(title, (28, 22))
+            return
+
+        logo = self.scale_to_fit(self.header_logo, (180, 54))
+        self.screen.blit(logo, (24, 18))
 
     def draw_lane_view(self, app: RhythmPrototype) -> None:
         if not app.analysis:
