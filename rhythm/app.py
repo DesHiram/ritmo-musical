@@ -4,6 +4,8 @@ import json
 import platform
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tkinter as tk
 from tkinter import filedialog
@@ -328,15 +330,7 @@ class RhythmPrototype:
             self.return_to_setup()
 
     def select_audio_file(self) -> None:
-        file_path = filedialog.askopenfilename(
-            title="Selecciona un archivo de audio",
-            filetypes=[
-                ("Archivos de audio", "*.mp3 *.wav"),
-                ("MP3", "*.mp3"),
-                ("WAV", "*.wav"),
-            ],
-        )
-        self.tk_root.update()
+        file_path = self.open_audio_file_dialog()
 
         if not file_path:
             self.status_message = "Carga cancelada."
@@ -355,6 +349,83 @@ class RhythmPrototype:
             )
         else:
             self.status_message = f"Archivo guardado: {selected_name}"
+
+    def open_audio_file_dialog(self) -> str:
+        self.status_message = "Abriendo selector de archivos..."
+        self.draw()
+        self.present_frame()
+        pygame.event.pump()
+        pygame.event.set_grab(False)
+
+        try:
+            if sys.platform.startswith("linux"):
+                native_file_path = self.open_linux_audio_file_dialog()
+                if native_file_path is not None:
+                    return native_file_path
+
+            return self.open_tk_audio_file_dialog()
+        finally:
+            pygame.event.set_grab(False)
+            pygame.event.clear()
+
+    def open_linux_audio_file_dialog(self) -> str | None:
+        if shutil.which("zenity"):
+            command = [
+                "zenity",
+                "--file-selection",
+                "--title=Selecciona un archivo de audio",
+                "--file-filter=Audio | *.mp3 *.wav *.MP3 *.WAV",
+            ]
+        elif shutil.which("kdialog"):
+            command = [
+                "kdialog",
+                "--getopenfilename",
+                str(Path.home()),
+                "*.mp3 *.wav *.MP3 *.WAV|Archivos de audio",
+                "--title",
+                "Selecciona un archivo de audio",
+            ]
+        else:
+            return None
+
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+        except OSError:
+            return None
+
+        if completed.returncode != 0:
+            return ""
+
+        return completed.stdout.strip()
+
+    def open_tk_audio_file_dialog(self) -> str:
+        self.tk_root.deiconify()
+        self.tk_root.withdraw()
+        self.tk_root.update_idletasks()
+        self.tk_root.attributes("-topmost", True)
+
+        try:
+            file_path = filedialog.askopenfilename(
+                parent=self.tk_root,
+                title="Selecciona un archivo de audio",
+                initialdir=str(Path.home()),
+                filetypes=[
+                    ("Archivos de audio", "*.mp3 *.wav"),
+                    ("MP3", "*.mp3"),
+                    ("WAV", "*.wav"),
+                ],
+            )
+            self.tk_root.update()
+        finally:
+            self.tk_root.attributes("-topmost", False)
+            self.tk_root.withdraw()
+
+        return file_path
 
     def generate_track(self) -> None:
         if not self.selected_file:

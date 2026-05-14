@@ -43,7 +43,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/cpdito/icono.ico' if sys.platform.startswith('win') else None,
+    icon=None,
 )
 coll = COLLECT(
     exe,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable
 
 import librosa
 import numpy as np
@@ -16,9 +17,9 @@ class TrackBuilder:
         if audio.size == 0:
             raise ValueError("El archivo no contiene audio utilizable.")
 
-        harmonic_audio, _ = librosa.effects.hpss(audio)
+        harmonic_audio, percussive_audio = librosa.effects.hpss(audio)
         onset_envelope = librosa.onset.onset_strength(
-            y=harmonic_audio,
+            y=percussive_audio,
             sr=sample_rate,
             hop_length=hop_length,
         )
@@ -33,28 +34,363 @@ class TrackBuilder:
             sample_rate=sample_rate,
             hop_length=hop_length,
         )
-        melody_frames = self.build_melody_event_frames(
-            melody_curve=melody_curve,
-            onset_envelope=onset_envelope,
-            beat_frames=beat_frames,
+        normalized_tempo = float(np.asarray(tempo).reshape(-1)[0])
+        if normalized_tempo <= 0:
+            normalized_tempo = 120.0
+
+        notes = self.build_piu_style_notes(
+            audio=audio,
+            harmonic_audio=harmonic_audio,
             sample_rate=sample_rate,
             hop_length=hop_length,
+            tempo=normalized_tempo,
+            beat_frames=beat_frames,
+            onset_envelope=onset_envelope,
+            melody_curve=melody_curve,
         )
-        if melody_frames.size < 8:
-            raise ValueError("No se detecto melodia suficiente para construir la pista.")
+        return TrackAnalysis(tempo=normalized_tempo, notes=notes)
 
-        event_times = librosa.frames_to_time(
-            melody_frames,
+    def build_piu_style_notes(
+        self,
+        audio: np.ndarray,
+        harmonic_audio: np.ndarray,
+        sample_rate: int,
+        hop_length: int,
+        tempo: float,
+        beat_frames: np.ndarray,
+        onset_envelope: np.ndarray,
+        melody_curve: np.ndarray,
+    ) -> list[NoteEvent]:
+        duration = float(librosa.get_duration(y=audio, sr=sample_rate))
+        beat_times = librosa.frames_to_time(
+            np.asarray(beat_frames).reshape(-1),
             sr=sample_rate,
             hop_length=hop_length,
         )
-        notes = self.assign_lanes(
-            event_frames=melody_frames,
-            event_times=event_times,
-            melody_curve=melody_curve,
+        beat_interval = 60.0 / max(1.0, tempo)
+        beat_offset = float(beat_times[0]) if beat_times.size else 0.0
+        if beat_times.size < 4:
+            beat_times = np.arange(beat_offset, duration + beat_interval, beat_interval)
+
+        grid_times = self.build_quantized_grid(
+            beat_offset=beat_offset,
+            duration=duration,
+            beat_interval=beat_interval,
         )
-        normalized_tempo = float(np.asarray(tempo).reshape(-1)[0])
-        return TrackAnalysis(tempo=normalized_tempo, notes=notes)
+        if grid_times.size == 0:
+            return []
+
+        rms = librosa.feature.rms(y=audio, hop_length=hop_length)[0]
+        harmonic_rms = librosa.feature.rms(y=harmonic_audio, hop_length=hop_length)[0]
+        energy = self.grid_energy(
+            grid_times=grid_times,
+            onset_envelope=onset_envelope,
+            rms=rms,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+        )
+        harmonic_energy = self.grid_energy(
+            grid_times=grid_times,
+            onset_envelope=harmonic_rms,
+            rms=harmonic_rms,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+        )
+        accents = self.detect_grid_accents(energy)
+        phrase_energy = self.smooth_grid_energy(energy, window_size=16)
+        low, mid, high = self.energy_thresholds(phrase_energy)
+
+        pitch_floor, pitch_ceiling = self.melody_range(melody_curve)
+        pattern_cursor = 0
+        last_lane: int | None = None
+        last_time_by_lane = [-999.0 for _ in range(LANE_COUNT)]
+        occupied: set[tuple[int, int]] = set()
+        notes: list[NoteEvent] = []
+
+        for index, hit_time in enumerate(grid_times):
+            beat_fraction = index % 4
+            beat_in_measure = (index // 4) % 4
+            measure_index = index // 16
+            current_energy = phrase_energy[index]
+            has_accent = accents[index]
+
+            if not self.should_place_step(
+                beat_fraction=beat_fraction,
+                beat_in_measure=beat_in_measure,
+                measure_index=measure_index,
+                current_energy=current_energy,
+                has_accent=has_accent,
+                low=low,
+                mid=mid,
+                high=high,
+            ):
+                continue
+
+            melodic_lane = self.melody_lane_for_time(
+                hit_time=hit_time,
+                melody_curve=melody_curve,
+                sample_rate=sample_rate,
+                hop_length=hop_length,
+                pitch_floor=pitch_floor,
+                pitch_ceiling=pitch_ceiling,
+            )
+            lanes = self.pattern_lanes(
+                pattern_cursor=pattern_cursor,
+                melodic_lane=melodic_lane,
+                last_lane=last_lane,
+                strong_step=beat_fraction == 0,
+            )
+            pattern_cursor += 1
+
+            if self.should_place_jump(
+                beat_fraction=beat_fraction,
+                beat_in_measure=beat_in_measure,
+                measure_index=measure_index,
+                current_energy=current_energy,
+                has_accent=has_accent,
+                high=high,
+            ):
+                lanes = self.jump_lanes(pattern_cursor, melodic_lane)
+
+            added_lanes = self.add_step_notes(
+                notes=notes,
+                lanes=lanes,
+                hit_time=float(hit_time),
+                duration=0.0,
+                last_time_by_lane=last_time_by_lane,
+                occupied=occupied,
+            )
+            if added_lanes:
+                last_lane = added_lanes[-1]
+
+        return sorted(notes, key=lambda note: (note.hit_time, note.lane))
+
+    def build_quantized_grid(
+        self,
+        beat_offset: float,
+        duration: float,
+        beat_interval: float,
+    ) -> np.ndarray:
+        step_interval = beat_interval / 4.0
+        if step_interval <= 0:
+            return np.array([], dtype=float)
+
+        start_time = beat_offset
+        while start_time - step_interval >= 0.0:
+            start_time -= step_interval
+
+        return np.arange(start_time, duration + step_interval, step_interval, dtype=float)
+
+    def grid_energy(
+        self,
+        grid_times: np.ndarray,
+        onset_envelope: np.ndarray,
+        rms: np.ndarray,
+        sample_rate: int,
+        hop_length: int,
+    ) -> np.ndarray:
+        onset = self.normalize_curve(onset_envelope)
+        volume = self.normalize_curve(rms)
+        frame_seconds = hop_length / sample_rate
+        values: list[float] = []
+
+        for hit_time in grid_times:
+            frame = max(0, int(round(hit_time / frame_seconds)))
+            onset_value = self.local_curve_value(onset, frame, radius=1)
+            volume_value = self.local_curve_value(volume, frame, radius=2)
+            values.append((onset_value * 0.68) + (volume_value * 0.32))
+
+        return np.asarray(values, dtype=float)
+
+    def detect_grid_accents(self, energy: np.ndarray) -> np.ndarray:
+        if energy.size == 0:
+            return np.array([], dtype=bool)
+
+        floor = max(float(np.percentile(energy, 62)), 0.12)
+        accents = np.zeros(energy.size, dtype=bool)
+        for index, value in enumerate(energy):
+            start = max(0, index - 1)
+            stop = min(energy.size, index + 2)
+            accents[index] = value >= floor and value >= float(np.max(energy[start:stop]))
+        return accents
+
+    def smooth_grid_energy(self, energy: np.ndarray, window_size: int) -> np.ndarray:
+        if energy.size == 0:
+            return energy
+
+        window_size = max(1, min(window_size, energy.size))
+        kernel = np.ones(window_size, dtype=float) / window_size
+        return np.convolve(energy, kernel, mode="same")
+
+    def energy_thresholds(self, energy: np.ndarray) -> tuple[float, float, float]:
+        if energy.size == 0:
+            return 0.0, 0.0, 0.0
+
+        return (
+            float(np.percentile(energy, 30)),
+            float(np.percentile(energy, 58)),
+            float(np.percentile(energy, 78)),
+        )
+
+    def should_place_step(
+        self,
+        beat_fraction: int,
+        beat_in_measure: int,
+        measure_index: int,
+        current_energy: float,
+        has_accent: bool,
+        low: float,
+        mid: float,
+        high: float,
+    ) -> bool:
+        if current_energy < low * 0.82 and not has_accent:
+            return False
+
+        if beat_fraction == 0:
+            return current_energy >= low or beat_in_measure in {0, 2}
+
+        if beat_fraction == 2:
+            return has_accent or current_energy >= mid or (measure_index + beat_in_measure) % 3 == 0
+
+        if current_energy >= high and has_accent:
+            return True
+
+        return current_energy >= high * 1.04 and (measure_index + beat_in_measure + beat_fraction) % 4 == 0
+
+    def pattern_lanes(
+        self,
+        pattern_cursor: int,
+        melodic_lane: int | None,
+        last_lane: int | None,
+        strong_step: bool,
+    ) -> list[int]:
+        patterns = [
+            [0, 4, 1, 3],
+            [1, 2, 3, 2],
+            [0, 2, 4, 2],
+            [3, 1, 4, 0],
+            [2, 0, 3, 1],
+            [4, 2, 1, 2],
+        ]
+        pattern = patterns[(pattern_cursor // 4) % len(patterns)]
+        lane = pattern[pattern_cursor % len(pattern)]
+
+        if melodic_lane is not None:
+            if strong_step:
+                lane = melodic_lane
+            else:
+                lane = int(round((lane + melodic_lane) / 2))
+
+        if last_lane is not None and lane == last_lane:
+            lane = (lane + 2) % LANE_COUNT
+
+        return [max(0, min(LANE_COUNT - 1, lane))]
+
+    def should_place_jump(
+        self,
+        beat_fraction: int,
+        beat_in_measure: int,
+        measure_index: int,
+        current_energy: float,
+        has_accent: bool,
+        high: float,
+    ) -> bool:
+        if beat_fraction != 0 or current_energy < high:
+            return False
+
+        return has_accent or (beat_in_measure in {0, 2} and measure_index % 2 == 1)
+
+    def jump_lanes(self, pattern_cursor: int, melodic_lane: int | None) -> list[int]:
+        jump_pairs = [(0, 4), (1, 3), (0, 3), (1, 4), (2, 4), (0, 2)]
+        if melodic_lane is None:
+            return list(jump_pairs[pattern_cursor % len(jump_pairs)])
+
+        candidates = [pair for pair in jump_pairs if melodic_lane in pair]
+        if candidates:
+            return list(candidates[pattern_cursor % len(candidates)])
+        return list(jump_pairs[pattern_cursor % len(jump_pairs)])
+
+    def hold_duration_for_step(
+        self,
+        index: int,
+        beat_fraction: int,
+        beat_interval: float,
+        phrase_energy: np.ndarray,
+        harmonic_energy: np.ndarray,
+        high: float,
+    ) -> float:
+        if beat_fraction != 0 or index + 8 >= harmonic_energy.size:
+            return 0.0
+
+        harmonic_slice = harmonic_energy[index : index + 8]
+        phrase_slice = phrase_energy[index : index + 8]
+        if float(np.mean(harmonic_slice)) < 0.48 or float(np.max(phrase_slice)) >= high * 1.08:
+            return 0.0
+
+        return round(beat_interval * (2.0 if float(np.mean(harmonic_slice)) > 0.68 else 1.0), 3)
+
+    def add_step_notes(
+        self,
+        notes: list[NoteEvent],
+        lanes: Iterable[int],
+        hit_time: float,
+        duration: float,
+        last_time_by_lane: list[float],
+        occupied: set[tuple[int, int]],
+    ) -> list[int]:
+        added_lanes: list[int] = []
+        time_key = int(round(hit_time * 1000))
+
+        for lane in lanes:
+            if lane < 0 or lane >= LANE_COUNT:
+                continue
+            if (time_key, lane) in occupied:
+                continue
+            if hit_time - last_time_by_lane[lane] < 0.07:
+                continue
+
+            notes.append(NoteEvent(lane=lane, hit_time=hit_time, duration=duration))
+            occupied.add((time_key, lane))
+            last_time_by_lane[lane] = hit_time
+            added_lanes.append(lane)
+
+        return added_lanes
+
+    def normalize_curve(self, curve: np.ndarray) -> np.ndarray:
+        if curve.size == 0:
+            return np.array([], dtype=float)
+
+        curve = np.asarray(curve, dtype=float)
+        ceiling = float(np.percentile(curve, 95))
+        if ceiling <= 0.0:
+            return np.zeros(curve.size, dtype=float)
+        return np.clip(curve / ceiling, 0.0, 1.0)
+
+    def local_curve_value(self, curve: np.ndarray, frame: int, radius: int) -> float:
+        if curve.size == 0:
+            return 0.0
+
+        frame = max(0, min(curve.size - 1, frame))
+        start = max(0, frame - radius)
+        stop = min(curve.size, frame + radius + 1)
+        return float(np.max(curve[start:stop]))
+
+    def melody_lane_for_time(
+        self,
+        hit_time: float,
+        melody_curve: np.ndarray,
+        sample_rate: int,
+        hop_length: int,
+        pitch_floor: float,
+        pitch_ceiling: float,
+    ) -> int | None:
+        frame = int(round(hit_time / (hop_length / sample_rate)))
+        return self.melody_lane_for_frame(
+            frame=frame,
+            melody_curve=melody_curve,
+            pitch_floor=pitch_floor,
+            pitch_ceiling=pitch_ceiling,
+        )
 
     def extract_melody_curve(
         self,

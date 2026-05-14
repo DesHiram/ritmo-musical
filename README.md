@@ -33,27 +33,40 @@ python main.py
 
 Nota: en esta configuracion uso `pygame-ce`, que mantiene `import pygame` y evita problemas de compatibilidad que puede tener `pygame` clasico con Python 3.14 en Windows.
 
-## Como ejecutar en Raspberry Pi 5 / Debian 12 ARM64
-
-Estos comandos asumen que estas dentro de la carpeta del proyecto:
+## Como ejecutar en Fedora
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip python3-tk ffmpeg \
-  build-essential python3-dev pkg-config \
-  libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev \
-  libfreetype6-dev libportmidi-dev libsndfile1
+chmod +x scripts/*.sh
+./scripts/setup_fedora.sh
+./scripts/run_fedora.sh
+```
 
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
+El proyecto no guarda `.venv`, `dist`, `build` ni cachés dentro del repo. Si necesitas limpiar otra vez:
 
-export IMAGEIO_FFMPEG_EXE=/usr/bin/ffmpeg
-python main.py
+```bash
+./scripts/clean_project.sh
+```
+
+## Como ejecutar en Raspberry Pi 5 / Debian 12 ARM64
+
+La forma recomendada es copiar el proyecto completo a la Raspberry y ejecutar los scripts incluidos.
+No copies la carpeta `.venv`; el entorno virtual se crea directo en la Raspberry.
+
+```bash
+chmod +x scripts/*.sh
+./scripts/setup_raspberry.sh
+./scripts/run_raspberry.sh
 ```
 
 Ejecutalo desde el escritorio de Raspberry Pi OS/Debian, no desde una sesion SSH sin entorno grafico, porque el juego abre ventana con `pygame` y selector de archivos con `tkinter`.
+
+Para crear un paquete limpio desde esta computadora y pasarlo por USB o `scp`:
+
+```bash
+./scripts/build_raspberry_bundle.sh
+```
+
+Eso genera `dist/ritmo-musical-raspberry.tar.gz` sin `.venv`, `dist`, `build`, cachés ni archivos de biblioteca local.
 
 La biblioteca de canciones se guarda por plataforma, por ejemplo `saved_songs.windows_amd64.json` o `saved_songs.linux_aarch64.json`. Asi puedes usar el mismo proyecto en Windows y en Raspberry sin que las rutas de canciones de un sistema rompan el otro.
 
